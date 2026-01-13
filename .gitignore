@@ -50,6 +50,10 @@ results/
 *.tar.gz
 *.tar
 
+# Data directory symbolic links (다른 위치에서 심볼릭 링크로 연결된 디렉토리)
+data/GDCMD
+data/semi
+
 # OS
 .DS_Store
 Thumbs.db
