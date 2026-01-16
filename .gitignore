@@ -43,6 +43,7 @@ ENV/
 
 # Results and logs
 results/
+results_4y/
 *.log
 
 # Data files (큰 파일은 제외)

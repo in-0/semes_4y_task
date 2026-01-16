@@ -8,26 +8,23 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
-from torch.utils.data import DataLoader
 
 from losses import *
 import Moco_fusion_mm
 from utils import Meter
 from logger import setup_logger
 import data.dataloader as dataloader 
-from models import create_model, create_optimizer_and_scheduler, create_loss_functions
+from models import create_model, create_optimizer_and_scheduler
+from losses import create_loss_functions
 
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--save_path', type=str, default='./results', help='Directory to save the model')
-parser.add_argument('--seed', type=int, default=777, help='Seed')
+parser.add_argument('--seed', type=int, default=666, help='Seed')
 parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
 parser.add_argument('--num_epochs', type=int, default=30, help='Number of epochs')
-parser.add_argument('--image_size', type=int, default=224, help='Image size')
 parser.add_argument('--scheduler', type=str, choices=['default', 'step', 'cosine'], default='cosine', help='Choose Scheduler')
 parser.add_argument('--step_size', type=int, default=8, help='Step size for learning rate scheduler')
-parser.add_argument('--loss', choices=['ce', 'reweight', 'BalancedSoftmax', 'Paco'], default='Paco', help='Loss function')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--num_layers', type=int, default=5, help='Number of the sensor backbone layers')
 parser.add_argument('--dim', type=int, default=128, help='Model inner dimension')
@@ -35,12 +32,10 @@ parser.add_argument('--imb_ratio', type=float, default=0.02, help='imbalance rat
 parser.add_argument('--comment', type=str, default='sensor_fusion_result', help='exp comment')
 parser.add_argument('--data', type=str, choices=['gdcm', 'sms'], default='gdcm', help='Choose dataset loader: gdcm for GDCMDFusion, sms for SEMIDataset')
 parser.add_argument('--modality', type=str, choices=['fusion', 'sensor', 'vision'], default='fusion', help='Choose modality: fusion, sensor only, or vision only')
-parser.add_argument('--fusion_type', type=str, choices=['late', 'text_similarity'], default='late', help='Fusion type: late fusion or text similarity based fusion')
 parser.add_argument('--use_textemb', action='store_true', help='Use text embeddings for similarity-based weighting in LateFusion')
 parser.add_argument('--use_dim_matching_layer', action='store_true', help='Use dimension matching layer in LateFusion (target_dim=1024)')
 
 # args for Paco
-parser.add_argument('--reload', default=None, type=str, help='load supervised model')
 parser.add_argument('--alpha', default=0.1, type=float, help='contrast weight among samples')
 parser.add_argument('--beta', default=0.5, type=float, help='contrast weight between centers and samples')
 parser.add_argument('--gamma', default=0.5, type=float, help='paco loss')
@@ -55,14 +50,10 @@ parser.add_argument('--lamb_ce_fusion', type=float, default=1.0, help='ce loss f
 parser.add_argument('--lamb_mtm_fusion', type=float, default=1.0, help='mtm loss factor for fusion')
 parser.add_argument('--mtm_lambda', type=float, default=0.5, help='lambda weight for mtm loss')
 
-# args for text similarity fusion
-parser.add_argument('--embedding_dim', type=int, default=512, help='Text embedding dimension')
-parser.add_argument('--temperature', type=float, default=0.1, help='Temperature for similarity calculation')
-
 # args for loss functions
-parser.add_argument('--use_paco', action='store_true', default=True, help='Use PaCoLoss')
-parser.add_argument('--use_cb', action='store_true', default=True, help='Use CBLoss')
-parser.add_argument('--use_mtm', action='store_true', default=False, help='Use MTMLoss (Modality-Text Matching Loss)')
+parser.add_argument('--use_paco', action='store_true', help='Use PaCoLoss')
+parser.add_argument('--use_cb', action='store_true', help='Use CBLoss')
+parser.add_argument('--use_mtm', action='store_true', help='Use MTMLoss (Modality-Text Matching Loss)')
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -80,16 +71,11 @@ def create_directories(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def main():
     args = parser.parse_args()
     set_seed(args.seed)
-
-    # DDP single-process
-    os.environ["MASTER_ADDR"] = "localhost"
-    # os.environ["MASTER_PORT"] = "29500"
-    dist.init_process_group(backend='nccl', world_size=1, rank=0)
 
     # Save path
     time = datetime.datetime.now().strftime("%m-%d_%H-%M-%S")
@@ -107,7 +93,7 @@ def main():
     # use_textemb 관련 로깅
     if args.use_textemb:
         training_logger.info('Using text embeddings for similarity-based weighting')
-        if args.modality == 'fusion' and args.fusion_type == 'late':
+        if args.modality == 'fusion':
             training_logger.info('Text embeddings will be used in LateFusion')
         elif args.modality == 'sensor':
             training_logger.info('Text embeddings will be used in SensorTextFusion')
@@ -144,7 +130,7 @@ def main():
     num_epochs = args.num_epochs
     
     # 모델 생성
-    model = create_model(args, device)
+    model = create_model(args, DEVICE)
     
     # 옵티마이저와 스케줄러 생성
     fusion_optimizer, scheduler = create_optimizer_and_scheduler(model, args)
@@ -177,13 +163,13 @@ def main():
         for i, data in enumerate(fusion_train_loader):
             if args.modality == 'fusion':
                 images, sensors, targets = data
-                targets_oh = targets.float().to(device)
+                targets_oh = targets.float().to(DEVICE)
                 targets_int = targets_oh.argmax(dim=1)
 
-                images_q = images[0].to(device)  # (B, 3, 224, 224)
-                images_k = images[1].to(device)
-                sensors_q = sensors.to(device)
-                sensors_k = sensors.to(device)
+                images_q = images[0].to(DEVICE)  # (B, 3, 224, 224)
+                images_k = images[1].to(DEVICE)
+                sensors_q = sensors.to(DEVICE)
+                sensors_k = sensors.to(DEVICE)
 
                 features_moco, target_moco, logits_moco, feature_concat, vision_feature, sensor_feature = model(
                     im_q=images_q, im_k=images_k,
@@ -193,11 +179,11 @@ def main():
                 
             elif args.modality == 'sensor':
                 sensors, targets = data
-                targets_oh = targets.float().to(device)
+                targets_oh = targets.float().to(DEVICE)
                 targets_int = targets_oh.argmax(dim=1)
 
-                sensors_q = sensors.to(device)
-                sensors_k = sensors.to(device)
+                sensors_q = sensors.to(DEVICE)
+                sensors_k = sensors.to(DEVICE)
 
                 features_moco, target_moco, logits_moco, feature_concat, vision_feature, sensor_feature = model(
                     sen_q=sensors_q, sen_k=sensors_k,
@@ -206,22 +192,22 @@ def main():
                 
             elif args.modality == 'vision':
                 images, targets = data
-                targets_oh = targets.float().to(device)
+                targets_oh = targets.float().to(DEVICE)
                 targets_int = targets_oh.argmax(dim=1)
 
-                images_q = images[0].to(device)  # (B, 3, 224, 224)
-                images_k = images[1].to(device)
+                images_q = images[0].to(DEVICE)  # (B, 3, 224, 224)
+                images_k = images[1].to(DEVICE)
 
                 features_moco, target_moco, logits_moco, feature_concat, vision_feature, sensor_feature = model(
                     im_q=images_q, im_k=images_k,
                     labels=targets_int
                 )
 
-            pacoloss = fusion_criterion(features_moco, target_moco, logits_moco) if fusion_criterion is not None else torch.tensor(0.0).to(device)
-            celoss = aux_criterion(feature_concat, targets_oh) if aux_criterion is not None else torch.tensor(0.0).to(device)
+            pacoloss = fusion_criterion(features_moco, target_moco, logits_moco) if fusion_criterion is not None else torch.tensor(0.0).to(DEVICE)
+            celoss = aux_criterion(feature_concat, targets_oh) if aux_criterion is not None else torch.tensor(0.0).to(DEVICE)
             
             # MTMLoss 계산
-            mtmloss = torch.tensor(0.0).to(device)
+            mtmloss = torch.tensor(0.0).to(DEVICE)
             if mtm_criterion is not None:
                 if args.modality == 'fusion' and vision_feature is not None and sensor_feature is not None:
                     # fusion 모달리티: vision과 sensor 피쳐 모두 사용
@@ -269,23 +255,23 @@ def main():
             for data in fusion_test_loader:
                 if args.modality == 'fusion':
                     images, sensors, targets = data
-                    target_oh = targets.float().to(device)
-                    images_q = images.to(device)
-                    sensors_q = sensors.to(device)
+                    target_oh = targets.float().to(DEVICE)
+                    images_q = images.to(DEVICE)
+                    sensors_q = sensors.to(DEVICE)
 
                     logit1, logit2 = model(im_q=images_q, sen_q=sensors_q)
                     
                 elif args.modality == 'sensor':
                     sensors, targets = data
-                    target_oh = targets.float().to(device)
-                    sensors_q = sensors.to(device)
+                    target_oh = targets.float().to(DEVICE)
+                    sensors_q = sensors.to(DEVICE)
 
                     logit1, logit2 = model(sen_q=sensors_q)
                     
                 elif args.modality == 'vision':
                     images, targets = data
-                    target_oh = targets.float().to(device)
-                    images_q = images.to(device)
+                    target_oh = targets.float().to(DEVICE)
+                    images_q = images.to(DEVICE)
 
                     logit1, logit2 = model(im_q=images_q)
                 

@@ -274,7 +274,7 @@ def create_model(args, device):
             feat_dim = args.feat_dim
         
         if args.use_paco:
-            model = Moco_fusion_mm.MoCo(query_encoder=fusion_model, key_encoder=fusion_model2, modality=args.modality, feat_dim=feat_dim, use_textemb=args.use_textemb)
+            model = Moco_fusion_mm.MoCo(query_encoder=fusion_model, key_encoder=fusion_model2, modality=args.modality, feat_dim=feat_dim, use_dim_matching_layer=args.use_dim_matching_layer, m=args.moco_m, T=args.moco_t, K=args.moco_k)
         else:
             model = fusion_model
         
@@ -292,7 +292,7 @@ def create_model(args, device):
             sensor_model = SensorTextFusion(sensor_model, dim=args.dim, num_classes=args.num_classes, use_textemb=True).to(device)
             sensor_model2 = SensorTextFusion(sensor_model2, dim=args.dim, num_classes=args.num_classes, use_textemb=True).to(device)
         
-        model = Moco_fusion_mm.MoCo(query_encoder=sensor_model, key_encoder=sensor_model2, modality=args.modality, feat_dim=args.dim)
+        model = Moco_fusion_mm.MoCo(query_encoder=sensor_model, key_encoder=sensor_model2, modality=args.modality, feat_dim=args.dim, use_dim_matching_layer=args.use_dim_matching_layer, m=args.moco_m, T=args.moco_t, K=args.moco_k)
         
     elif args.modality == 'vision':
         # 이미지만 사용하는 모델
@@ -304,7 +304,7 @@ def create_model(args, device):
             vision_model = VisionTextFusion(vision_model, num_classes=args.num_classes, use_textemb=True).to(device)
             vision_model2 = VisionTextFusion(vision_model2, num_classes=args.num_classes, use_textemb=True).to(device)
         
-        model = Moco_fusion_mm.MoCo(query_encoder=vision_model, key_encoder=vision_model2, modality=args.modality, feat_dim=args.feat_dim)
+        model = Moco_fusion_mm.MoCo(query_encoder=vision_model, key_encoder=vision_model2, modality=args.modality, feat_dim=args.feat_dim, use_dim_matching_layer=args.use_dim_matching_layer, m=args.moco_m, T=args.moco_t, K=args.moco_k)
     
     return model
 
