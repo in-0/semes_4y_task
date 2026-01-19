@@ -3,7 +3,7 @@ from torch.utils.data import Dataset, DataLoader
 import os
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 import random
 import torch
 import torchvision.transforms as transforms
@@ -117,6 +117,14 @@ class GaussianBlur(object):
         sigma = random.uniform(self.sigma[0], self.sigma[1])
         return x.filter(ImageFilter.GaussianBlur(radius=sigma))
 
+class Solarize(object):
+    """Solarize augmentation from SimCLR https://arxiv.org/abs/2002.05709"""
+    def __init__(self, threshold=128):
+        self.threshold = threshold
+    
+    def __call__(self, x):
+        return ImageOps.solarize(x, threshold=self.threshold)
+
 class GDCMDFusion(Dataset):
     num_classes = 4
     def __init__(self, images, sensors, labels, path_, image_size=224, train=None, imb_ratio=None, seed=666):
@@ -138,21 +146,29 @@ class GDCMDFusion(Dataset):
             self.labels = self.labels[sample_indices]
         
         if train:
+            # Query transform: MoCo v2 스타일 강화된 augmentation
             self.transform = transforms.Compose([
                 transforms.ToPILImage(), 
-                transforms.Resize((image_size, image_size)), 
-                transforms.RandomCrop((image_size, image_size), padding=4),
+                transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
+                transforms.RandomApply([
+                    transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
+                ], p=0.8),
+                transforms.RandomGrayscale(p=0.2),
+                transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
+                transforms.RandomApply([Solarize(threshold=128)], p=0.2),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor()
             ])
+            # Key transform: Query와 동일한 강도로 augmentation
             self.transform2 = transforms.Compose([
                 transforms.ToPILImage(), 
-                transforms.RandomResizedCrop(image_size),
+                transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
                 transforms.RandomApply([
-                    transforms.ColorJitter(0.4, 0.4, 0.4, 0.0)
-                ], p=1.0),
+                    transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
+                ], p=0.8),
                 transforms.RandomGrayscale(p=0.2),
                 transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
+                transforms.RandomApply([Solarize(threshold=128)], p=0.2),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor()
             ])
@@ -259,23 +275,31 @@ class SEMIDataset(Dataset):
         self.cls_num_list = counts.tolist()
 
         if self.train:
+            # Query transform: MoCo v2 스타일 강화된 augmentation
             self.transform_q = transforms.Compose([
                 transforms.ToPILImage(),
                 transforms.Lambda(lambda img: img.convert('RGB')),
-                transforms.Resize((image_size, image_size)),
-                transforms.RandomCrop((image_size, image_size), padding=4),
+                transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
+                transforms.RandomApply([
+                    transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
+                ], p=0.8),
+                transforms.RandomGrayscale(p=0.2),
+                transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
+                transforms.RandomApply([Solarize(threshold=128)], p=0.2),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
             ])
+            # Key transform: Query와 동일한 강도로 augmentation
             self.transform_k = transforms.Compose([
                 transforms.ToPILImage(),
                 transforms.Lambda(lambda img: img.convert('RGB')),
-                transforms.RandomResizedCrop(image_size),
+                transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
                 transforms.RandomApply([
-                    transforms.ColorJitter(0.4, 0.4, 0.4, 0.0)
-                ], p=1.0),
+                    transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
+                ], p=0.8),
                 transforms.RandomGrayscale(p=0.2),
                 transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
+                transforms.RandomApply([Solarize(threshold=128)], p=0.2),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
             ])
@@ -377,20 +401,12 @@ def build_dataset(data_root, mode=None, imb_ratio=None, seed=666):
             train=False
         )
 
-        print(f"[GDCMD] Train size: {len(train_dataset)}")
-        print(f"[GDCMD] Test size:  {len(test_dataset)}")
-        print(f"[GDCMD] Class Distribution (Train): {train_dataset.get_samples_per_cls()}")
-
     elif mode == "semi":
         train_pkl = os.path.join(data_root, 'semes_train.pkl')
         val_pkl = os.path.join(data_root, 'semes_val.pkl')
 
         train_dataset = SEMIDataset(pkl_file=train_pkl, train=True, image_size=224, imb_ratio=imb_ratio, seed=seed)
         test_dataset = SEMIDataset(pkl_file=val_pkl, train=False, image_size=224)
-
-        print(f"[semi] Train size: {len(train_dataset)}")
-        print(f"[semi] Test size:  {len(test_dataset)}")
-        print(f"[semi] Class Distribution (Train): {train_dataset.get_samples_per_cls()}")
 
     else:
         raise ValueError("Invalid mode! Choose between 'GDCMD' and 'semi'.")

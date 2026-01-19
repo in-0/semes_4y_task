@@ -39,7 +39,6 @@ parser.add_argument('--use_dim_matching_layer', action='store_true', help='Use d
 parser.add_argument('--alpha', default=0.1, type=float, help='contrast weight among samples')
 parser.add_argument('--beta', default=0.5, type=float, help='contrast weight between centers and samples')
 parser.add_argument('--gamma', default=0.5, type=float, help='paco loss')
-parser.add_argument('--aug', default=None, type=str, help='aug strategy')
 parser.add_argument('--num_classes', default=4, type=int, help='num classes in dataset')
 parser.add_argument('--feat_dim', default=1280, type=int, help='last feature dim of backbone')
 parser.add_argument('--moco_k', default=1024, type=int, help='queue size; number of negative keys (default: 65536)')
@@ -120,6 +119,10 @@ def main():
         train_dataset, test_dataset = dataloader.build_dataset(
             data_root, mode='semi', seed=args.seed, imb_ratio=args.imb_ratio
         )
+    training_logger.info(f"[{args.data}] Train size: {len(train_dataset)}")
+    training_logger.info(f"[{args.data}] Test size:  {len(test_dataset)}")
+    training_logger.info(f"[{args.data}] Class Distribution (Train): {train_dataset.get_samples_per_cls()}")
+
 
     # 데이터로더 생성
     fusion_train_loader, fusion_test_loader = dataloader.create_data_loaders(args, train_dataset, test_dataset)
