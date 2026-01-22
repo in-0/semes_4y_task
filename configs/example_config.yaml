@@ -1,0 +1,42 @@
+# Example configuration file for training
+# Usage: python train.py --config configs/example_config.yaml
+
+# Basic settings
+save_path: ./results
+seed: 666
+batch_size: 64
+num_epochs: 100
+scheduler: cosine
+step_size: 8
+lr: 0.0003
+num_layers: 5
+dim: 128
+imb_ratio: 0.02
+comment: sms_fusion_example
+data: sms
+modality: fusion
+
+# Model settings
+use_textemb: false
+use_dim_matching_layer: true
+
+# PaCo/MoCo settings
+alpha: 0.3
+beta: 0.5
+gamma: 0.5
+num_classes: 4
+feat_dim: 1280
+moco_k: 1024
+moco_m: 0.99
+moco_t: 0.1
+
+# Loss weights
+lamb_paco_fusion: 0.5
+lamb_ce_fusion: 2.0
+lamb_mtm_fusion: 1.0
+mtm_lambda: 0.5
+
+# Loss functions
+use_paco: true
+use_cb: true
+use_mtm: false

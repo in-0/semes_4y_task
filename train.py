@@ -4,6 +4,8 @@ import logging
 import datetime
 import argparse
 import numpy as np
+import yaml
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -18,6 +20,7 @@ from models import create_model, create_optimizer_and_scheduler
 from losses import create_loss_functions
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--config', type=str, default=None, help='Path to config YAML file')
 
 parser.add_argument('--save_path', type=str, default='./results', help='Directory to save the model')
 parser.add_argument('--seed', type=int, default=666, help='Seed')
@@ -70,10 +73,72 @@ def create_directories(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
+def load_config(config_path):
+    """Load config from YAML file"""
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
+
+def save_config(config, save_path, comment=None):
+    """Save config to YAML file"""
+    if comment:
+        # Use comment as filename, sanitize it for filesystem
+        safe_comment = comment.replace('/', '_').replace('\\', '_')
+        config_filename = f'{safe_comment}.yaml'
+    else:
+        config_filename = 'config.yaml'
+    
+    config_path = os.path.join(save_path, config_filename)
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    return config_path
+
+def merge_config_with_args(args, config):
+    """Merge config dict with argparse args, config takes precedence"""
+    if config is None:
+        return args
+    
+    # Convert args to dict
+    args_dict = vars(args)
+    
+    # Update with config values
+    for key, value in config.items():
+        if key in args_dict:
+            # Handle boolean flags (action='store_true')
+            if isinstance(args_dict[key], bool) and isinstance(value, bool):
+                args_dict[key] = value
+            elif not isinstance(args_dict[key], bool):
+                args_dict[key] = value
+    
+    # Create new Namespace
+    merged_args = argparse.Namespace(**args_dict)
+    return merged_args
+
+def args_to_dict(args):
+    """Convert argparse Namespace to dict, handling boolean flags"""
+    args_dict = {}
+    for key, value in vars(args).items():
+        # Convert boolean to proper boolean (not string)
+        if isinstance(value, bool):
+            args_dict[key] = value
+        else:
+            args_dict[key] = value
+    return args_dict
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def main():
     args = parser.parse_args()
+    
+    # Load config file if provided
+    config = None
+    if args.config:
+        if not os.path.exists(args.config):
+            raise FileNotFoundError(f"Config file not found: {args.config}")
+        config = load_config(args.config)
+        args = merge_config_with_args(args, config)
+        print(f"Loaded config from: {args.config}")
+    
     set_seed(args.seed)
 
     # Save path
@@ -87,6 +152,11 @@ def main():
     setup_logger('testing_log', os.path.join(save_path, 'testing.log'))
     training_logger = logging.getLogger('training_log')
     test_logger = logging.getLogger('testing_log')
+    
+    # Save config to experiment directory
+    config_dict = args_to_dict(args)
+    config_path = save_config(config_dict, save_path, comment=args.comment)
+    training_logger.info(f'Config saved to: {config_path}')
     training_logger.info('Arguments: %s', args)
     
     # use_textemb 관련 로깅
@@ -108,16 +178,23 @@ def main():
     # 1. Dataset / DataLoader 설정
     # ---------------------------------------------------
     training_logger.info('Loading datasets...')
+    # MoCo 사용 시에만 강한 augmentation 적용
+    use_strong_aug = args.use_paco
+    if use_strong_aug:
+        training_logger.info('Using strong augmentation for MoCo training')
+    else:
+        training_logger.info('Using basic augmentation (MoCo not used)')
+    
     if args.data == 'gdcm':
         data_root = './data/GDCMD'
         # GDCMDFusion dataset -> (train_dataset, test_dataset)
         train_dataset, test_dataset = dataloader.build_dataset(
-            data_root, mode='GDCMD', seed=args.seed, imb_ratio=args.imb_ratio
+            data_root, mode='GDCMD', seed=args.seed, imb_ratio=args.imb_ratio, use_strong_aug=use_strong_aug
         )
     elif args.data == 'sms':
         data_root = './data/semi'
         train_dataset, test_dataset = dataloader.build_dataset(
-            data_root, mode='semi', seed=args.seed, imb_ratio=args.imb_ratio
+            data_root, mode='semi', seed=args.seed, imb_ratio=args.imb_ratio, use_strong_aug=use_strong_aug
         )
     training_logger.info(f"[{args.data}] Train size: {len(train_dataset)}")
     training_logger.info(f"[{args.data}] Test size:  {len(test_dataset)}")

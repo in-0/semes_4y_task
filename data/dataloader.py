@@ -127,7 +127,7 @@ class Solarize(object):
 
 class GDCMDFusion(Dataset):
     num_classes = 4
-    def __init__(self, images, sensors, labels, path_, image_size=224, train=None, imb_ratio=None, seed=666):
+    def __init__(self, images, sensors, labels, path_, image_size=224, train=None, imb_ratio=None, seed=666, use_strong_aug=False):
         self.img_dir = path_
         self.images = images
         self.sensors = sensors
@@ -146,32 +146,49 @@ class GDCMDFusion(Dataset):
             self.labels = self.labels[sample_indices]
         
         if train:
-            # Query transform: MoCo v2 스타일 강화된 augmentation
-            self.transform = transforms.Compose([
-                transforms.ToPILImage(), 
-                transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
-                transforms.RandomApply([
-                    transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
-                ], p=0.8),
-                transforms.RandomGrayscale(p=0.2),
-                transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
-                transforms.RandomApply([Solarize(threshold=128)], p=0.2),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor()
-            ])
-            # Key transform: Query와 동일한 강도로 augmentation
-            self.transform2 = transforms.Compose([
-                transforms.ToPILImage(), 
-                transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
-                transforms.RandomApply([
-                    transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
-                ], p=0.8),
-                transforms.RandomGrayscale(p=0.2),
-                transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
-                transforms.RandomApply([Solarize(threshold=128)], p=0.2),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor()
-            ])
+            if use_strong_aug:
+                # Query transform: MoCo v2 스타일 강화된 augmentation
+                self.transform = transforms.Compose([
+                    transforms.ToPILImage(), 
+                    transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
+                    transforms.RandomApply([
+                        transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
+                    ], p=0.8),
+                    transforms.RandomGrayscale(p=0.2),
+                    transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
+                    transforms.RandomApply([Solarize(threshold=128)], p=0.2),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor()
+                ])
+                # Key transform: Query와 동일한 강도로 augmentation
+                self.transform2 = transforms.Compose([
+                    transforms.ToPILImage(), 
+                    transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
+                    transforms.RandomApply([
+                        transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
+                    ], p=0.8),
+                    transforms.RandomGrayscale(p=0.2),
+                    transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
+                    transforms.RandomApply([Solarize(threshold=128)], p=0.2),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor()
+                ])
+            else:
+                # 기본 augmentation (MoCo 사용 안 할 때)
+                self.transform = transforms.Compose([
+                    transforms.ToPILImage(), 
+                    transforms.Resize((image_size, image_size)), 
+                    transforms.RandomCrop((image_size, image_size), padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor()
+                ])
+                self.transform2 = transforms.Compose([
+                    transforms.ToPILImage(), 
+                    transforms.Resize((image_size, image_size)), 
+                    transforms.RandomCrop((image_size, image_size), padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor()
+                ])
         else:
             self.transform = transforms.Compose([
                 transforms.ToPILImage(), 
@@ -252,7 +269,7 @@ class SEMIDataset(Dataset):
     - 이미지 파일이 경로일 경우 PIL.Image를 이용해 읽어오며, 3채널(RGB)로 변환해 사전학습 모델과 호환
     - 센서 데이터는 전체 평균/표준편차로 정규화함
     """
-    def __init__(self, pkl_file, train=True, image_size=224, imb_ratio=None, seed=666):
+    def __init__(self, pkl_file, train=True, image_size=224, imb_ratio=None, seed=666, use_strong_aug=False):
         super().__init__()
         with open(pkl_file, 'rb') as f:
             self.data = pickle.load(f)
@@ -275,34 +292,53 @@ class SEMIDataset(Dataset):
         self.cls_num_list = counts.tolist()
 
         if self.train:
-            # Query transform: MoCo v2 스타일 강화된 augmentation
-            self.transform_q = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.Lambda(lambda img: img.convert('RGB')),
-                transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
-                transforms.RandomApply([
-                    transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
-                ], p=0.8),
-                transforms.RandomGrayscale(p=0.2),
-                transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
-                transforms.RandomApply([Solarize(threshold=128)], p=0.2),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-            ])
-            # Key transform: Query와 동일한 강도로 augmentation
-            self.transform_k = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.Lambda(lambda img: img.convert('RGB')),
-                transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
-                transforms.RandomApply([
-                    transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
-                ], p=0.8),
-                transforms.RandomGrayscale(p=0.2),
-                transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
-                transforms.RandomApply([Solarize(threshold=128)], p=0.2),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-            ])
+            if use_strong_aug:
+                # Query transform: MoCo v2 스타일 강화된 augmentation
+                self.transform_q = transforms.Compose([
+                    transforms.ToPILImage(),
+                    transforms.Lambda(lambda img: img.convert('RGB')),
+                    transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
+                    transforms.RandomApply([
+                        transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
+                    ], p=0.8),
+                    transforms.RandomGrayscale(p=0.2),
+                    transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
+                    transforms.RandomApply([Solarize(threshold=128)], p=0.2),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                ])
+                # Key transform: Query와 동일한 강도로 augmentation
+                self.transform_k = transforms.Compose([
+                    transforms.ToPILImage(),
+                    transforms.Lambda(lambda img: img.convert('RGB')),
+                    transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0)),
+                    transforms.RandomApply([
+                        transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
+                    ], p=0.8),
+                    transforms.RandomGrayscale(p=0.2),
+                    transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
+                    transforms.RandomApply([Solarize(threshold=128)], p=0.2),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                ])
+            else:
+                # 기본 augmentation (MoCo 사용 안 할 때)
+                self.transform_q = transforms.Compose([
+                    transforms.ToPILImage(),
+                    transforms.Lambda(lambda img: img.convert('RGB')),
+                    transforms.Resize((image_size, image_size)),
+                    transforms.RandomCrop((image_size, image_size), padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                ])
+                self.transform_k = transforms.Compose([
+                    transforms.ToPILImage(),
+                    transforms.Lambda(lambda img: img.convert('RGB')),
+                    transforms.Resize((image_size, image_size)),
+                    transforms.RandomCrop((image_size, image_size), padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                ])
         else:
             self.transform_q = transforms.Compose([
                 transforms.ToPILImage(),
@@ -364,7 +400,7 @@ class SEMIDataset(Dataset):
         """라벨만 반환하는 메서드"""
         return torch.tensor(self.labels[index], dtype=torch.float32)
         
-def build_dataset(data_root, mode=None, imb_ratio=None, seed=666):
+def build_dataset(data_root, mode=None, imb_ratio=None, seed=666, use_strong_aug=False):
     if mode == "GDCMD":
         image_path = os.path.join(data_root, 'images/')
         sensor_path = os.path.join(data_root, 'sensors/Gas_Sensors_Measurements.csv')
@@ -391,7 +427,8 @@ def build_dataset(data_root, mode=None, imb_ratio=None, seed=666):
             path_=image_path,
             train=True,
             imb_ratio=imb_ratio,
-            seed=seed
+            seed=seed,
+            use_strong_aug=use_strong_aug
         )
         test_dataset = GDCMDFusion(
             [image_names[i] for i in X_test_indices],
@@ -405,7 +442,7 @@ def build_dataset(data_root, mode=None, imb_ratio=None, seed=666):
         train_pkl = os.path.join(data_root, 'semes_train.pkl')
         val_pkl = os.path.join(data_root, 'semes_val.pkl')
 
-        train_dataset = SEMIDataset(pkl_file=train_pkl, train=True, image_size=224, imb_ratio=imb_ratio, seed=seed)
+        train_dataset = SEMIDataset(pkl_file=train_pkl, train=True, image_size=224, imb_ratio=imb_ratio, seed=seed, use_strong_aug=use_strong_aug)
         test_dataset = SEMIDataset(pkl_file=val_pkl, train=False, image_size=224)
 
     else:
