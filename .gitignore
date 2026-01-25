@@ -45,6 +45,8 @@ ENV/
 results/
 results_4y/
 *.log
+results_4y_summary*.csv
+results_4y_summary*.xlsx
 
 # Data files (큰 파일은 제외)
 *.zip
