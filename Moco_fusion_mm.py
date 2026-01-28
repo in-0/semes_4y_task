@@ -167,12 +167,10 @@ class MoCo(nn.Module):
             logits, targets, vision_feature, sensor_feature
         """
         # compute query features
-        query, enc_feature = self.encoder_q(im_q, sen_q)  # query: NxC, MLP output, enc_feature: encoder feature
+        query, enc_feature, vision_feature, sensor_feature = self.encoder_q(im_q, sen_q)  # query: NxC, MLP output, enc_feature: encoder feature
         query = nn.functional.normalize(query, dim=1)
 
         # vision과 sensor 피쳐 추출
-        vision_feature = None
-        sensor_feature = None
         if hasattr(self.encoder_q, 'vision_model') and hasattr(self.encoder_q, 'sensor_model'):
             with torch.no_grad():
                 _, vision_feature = self.encoder_q.vision_model(im_q)
@@ -187,7 +185,7 @@ class MoCo(nn.Module):
         # compute key features
         with torch.no_grad():  # no gradient to keys
             self._momentum_update_key_encoder()  # update the key encoder
-            k, _ = self.encoder_k(im_k, sen_k)  # keys: NxC
+            k, _, _, _= self.encoder_k(im_k, sen_k)  # keys: NxC
             k = nn.functional.normalize(k, dim=1)
         
         # compute logits

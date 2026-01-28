@@ -37,6 +37,7 @@ parser.add_argument('--data', type=str, choices=['gdcm', 'sms'], default='gdcm',
 parser.add_argument('--modality', type=str, choices=['fusion', 'sensor', 'vision'], default='fusion', help='Choose modality: fusion, sensor only, or vision only')
 parser.add_argument('--use_textemb', action='store_true', help='Use text embeddings for similarity-based weighting in LateFusion')
 parser.add_argument('--use_dim_matching_layer', action='store_true', help='Use dimension matching layer in LateFusion (target_dim=1024)')
+parser.add_argument('--textemb_warmup_epochs', type=int, default=0, help='Number of warmup epochs without text embeddings (only after this epoch textemb is enabled)')
 
 # args for Paco
 parser.add_argument('--alpha', default=0.1, type=float, help='contrast weight among samples')
@@ -126,6 +127,25 @@ def args_to_dict(args):
     return args_dict
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def set_textemb_mode_for_model(model, enable: bool):
+    """
+    MoCo 래퍼 내부의 encoder_q / encoder_k 또는 단일 모델에 대해
+    use_textemb 플래그를 on/off 하는 헬퍼.
+    """
+
+    def _set_use_textemb(m):
+        # LateFusion, SensorTextFusion, VisionTextFusion 모두 use_textemb 속성을 가짐
+        if hasattr(m, 'use_textemb'):
+            m.use_textemb = enable
+
+    # MoCo 래퍼인 경우
+    if isinstance(model, Moco_fusion_mm.MoCo):
+        _set_use_textemb(model.encoder_q)
+        _set_use_textemb(model.encoder_k)
+    else:
+        _set_use_textemb(model)
 
 def main():
     args = parser.parse_args()
@@ -239,6 +259,13 @@ def main():
         preds_list = []
         test_targets_list = []
 
+        # text embedding warmup: 지정된 epoch 이전에는 text_emb를 사용하지 않음
+        if args.use_textemb:
+            use_textemb_now = epoch >= args.textemb_warmup_epochs
+            set_textemb_mode_for_model(model, use_textemb_now)
+        else:
+            set_textemb_mode_for_model(model, False)
+
         # ----------------- Training -----------------
         for i, data in enumerate(fusion_train_loader):
             if args.modality == 'fusion':
@@ -286,9 +313,10 @@ def main():
             pacoloss = fusion_criterion(features_moco, target_moco, logits_moco) if fusion_criterion is not None else torch.tensor(0.0).to(DEVICE)
             celoss = aux_criterion(feature_concat, targets_oh) if aux_criterion is not None else torch.tensor(0.0).to(DEVICE)
             
-            # MTMLoss 계산
+            # MTMLoss 계산 (warmup 이후에만 text_emb 기반 MTM 사용)
             mtmloss = torch.tensor(0.0).to(DEVICE)
-            if mtm_criterion is not None:
+            mtm_enabled = (mtm_criterion is not None) and (epoch >= args.textemb_warmup_epochs)
+            if mtm_enabled:
                 if args.modality == 'fusion' and vision_feature is not None and sensor_feature is not None:
                     # fusion 모달리티: vision과 sensor 피쳐 모두 사용
                     mtmloss = mtm_criterion(vision_feature, sensor_feature, targets_int)

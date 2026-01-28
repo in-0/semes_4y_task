@@ -8,6 +8,9 @@ from torchvision.models import mobilenet_v2
 import numpy as np
 import Moco_fusion_mm
 
+# SMS 클래스명 순서 정의
+SMS_CLASS_NAME = ['normal', 'caution', 'warning', 'critical']
+
 # MobileNet for image data
 class MobileNetV2CAE(nn.Module):
     def __init__(self, num_classes=4, pretrained=False, freeze_until=None):
@@ -223,6 +226,37 @@ class LateFusion(nn.Module):
             self.sensor_dimension_adapter = None
             fusion_dim = 1280 + dim  # vision(1280) + sensor(dim=128)
 
+        if self.use_textemb:
+            try:
+                # merged_text_embeddings.pth 파일 불러오기
+                text_embeddings_dict = torch.load('./semi_text_embs/merged_text_embeddings.pth')
+                # {'class_name': feat} 형태를 [num_classes, 1024] 형태로 변환
+                # 각 클래스의 prompts를 평균내어 하나의 embedding으로 만듦
+                # SMS_CLASS_NAME 순서대로 텐서 구성
+                text_embs = torch.zeros(num_classes, 1024)  # [num_classes, 1024]
+                
+                for idx, class_name in enumerate(SMS_CLASS_NAME):
+                    if class_name in text_embeddings_dict:
+                        feat = text_embeddings_dict[class_name]
+                        if feat.dim() == 1:
+                            # 이미 [1024] 형태면 그대로 사용
+                            text_embs[idx] = feat
+                        else:
+                            # [num_prompts, 1024] 형태면 prompts 차원에 대해 평균
+                            text_embs[idx] = feat.mean(dim=0)  # [num_prompts, 1024] -> [1024]
+                    else:
+                        print(f"Warning: class '{class_name}' not found in text embeddings, using random embedding")
+                        text_embs[idx] = torch.randn(1024)
+                
+                print(f"Loaded text embeddings with shape: {text_embs.shape}")
+            except FileNotFoundError:
+                print("Warning: ./semi_text_embs/merged_text_embeddings.pth not found. Using random embeddings.")
+                text_embs = torch.randn(num_classes, 1024)  # [num_classes, 1024]
+            except Exception as e:
+                print(f"Error loading text embeddings: {e}")
+                text_embs = torch.randn(num_classes, 1024)
+            self.register_buffer('text_embs', text_embs)
+
         self.fusion_dim = fusion_dim
         linear_add = nn.Linear(fusion_dim, fusion_dim)
         norm_add = nn.BatchNorm1d(fusion_dim)
@@ -244,10 +278,39 @@ class LateFusion(nn.Module):
             if self.sensor_dimension_adapter is not None:
                 x2 = self.sensor_dimension_adapter(x2)
         
-        # 두 feature를 concatenate
-        x = torch.cat((x1, x2), dim=1)
+        if self.use_textemb and self.training:
+            # text embeddings를 x1과 x2와 같은 device로 이동
+            text_embs = self.text_embs.to(x1.device)
+            
+            # x1과 text_embs 간의 cosine similarity 계산
+            x1_similarities = F.cosine_similarity(
+                x1.unsqueeze(1),  # [batch_size, 1, 1024]
+                text_embs.unsqueeze(0),  # [1, num_classes, 1024]
+                dim=2
+            )
+            x2_similarities = F.cosine_similarity(
+                x2.unsqueeze(1),  # [batch_size, 1, 1024]
+                text_embs.unsqueeze(0),  # [1, num_classes, 1024]
+                dim=2
+            )  # [batch_size, num_classes]
+            
+            # 각 샘플에 대해 가장 큰 similarity score만 사용
+            x1_sim_max = x1_similarities.max(dim=1)[0]  # [batch_size] - 가장 큰 similarity
+            x2_sim_max = x2_similarities.max(dim=1)[0]  # [batch_size] - 가장 큰 similarity
+            
+            # alpha 계산 (가장 큰 similarity를 기준으로)
+            alpha = x1_sim_max / (x1_sim_max + x2_sim_max + 1e-8)  # [batch_size]
+            alpha = alpha.unsqueeze(1)  # [batch_size, 1] - 브로드캐스팅을 위해 차원 추가
+            
+            # 가중치를 적용하여 fusion features 조정
+            x1_weighted = x1 + alpha * x1  # [batch_size, 1] * [batch_size, 1024] -> [batch_size, 1024]
+            x2_weighted = x2 + (1 - alpha) * x2  # [batch_size, 1] * [batch_size, 1024] -> [batch_size, 1024]
+            x = torch.cat((x1_weighted, x2_weighted), dim=1)
+        else:
+            x = torch.cat((x1, x2), dim=1)
+        
         x = self.add_layer(x)
-        return self.classifier(x), x
+        return self.classifier(x), x, x1, x2
 
 def create_model(args, device):
     """모델을 생성하는 함수"""
