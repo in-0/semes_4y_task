@@ -272,7 +272,7 @@ class MoCo(nn.Module):
     def _inference_fusion(self, im_q, sen_q):
         self.linear.to(device)
         self.linear_add.to(device)
-        q, enc_feature = self.encoder_q(im_q, sen_q)
+        q, enc_feature, vision_feature, sensor_feature = self.encoder_q(im_q, sen_q)
         q = nn.functional.normalize(q, dim=1)
         encoder_q_logits = self.linear(self.feat_after_avg_q) # linear classifier logits       
         linear_logits = self.linear_add(self.feat_after_avg_q)
