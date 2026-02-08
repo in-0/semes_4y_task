@@ -48,6 +48,8 @@ results_4y/
 results_4y_summary*.csv
 results_4y_summary*.xlsx
 
+wandb/
+
 # Data files (큰 파일은 제외)
 *.zip
 *.tar.gz
