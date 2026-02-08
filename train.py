@@ -58,6 +58,12 @@ parser.add_argument('--use_paco', action='store_true', help='Use PaCoLoss')
 parser.add_argument('--use_cb', action='store_true', help='Use CBLoss')
 parser.add_argument('--use_mtm', action='store_true', help='Use MTMLoss (Modality-Text Matching Loss)')
 
+# debug mode: 작은 데이터셋, 1 epoch, 로그 간격 1 step
+parser.add_argument('--debug', action='store_true', help='Debug mode: reduce dataset size, 1 epoch, log every step')
+
+# Weights & Biases
+parser.add_argument('--wandb', action='store_true', help='Use Weights & Biases for experiment tracking')
+
 def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -161,6 +167,13 @@ def main():
     
     set_seed(args.seed)
 
+    # Debug mode: epoch 1, 로그 간격 1 step
+    if args.debug:
+        args.num_epochs = 1
+        log_interval = 1
+    else:
+        log_interval = 4
+
     # Save path
     time = datetime.datetime.now().strftime("%m-%d_%H-%M-%S")
     save_path = os.path.join(args.save_path, f'{args.comment}_{time}')
@@ -178,6 +191,19 @@ def main():
     config_path = save_config(config_dict, save_path, comment=args.comment)
     training_logger.info(f'Config saved to: {config_path}')
     training_logger.info('Arguments: %s', args)
+    if args.debug:
+        training_logger.info('*** DEBUG MODE: num_epochs=1, reduced dataset, log every step ***')
+
+    # wandb 초기화
+    use_wandb = False
+    if args.wandb:
+        try:
+            import wandb
+            wandb.init(project='semes_exp', config=config_dict, name=args.comment)
+            use_wandb = True
+            training_logger.info('W&B experiment tracking enabled')
+        except ImportError:
+            training_logger.warning('wandb not installed. Run: pip install wandb')
     
     # use_textemb 관련 로깅
     if args.use_textemb:
@@ -216,9 +242,18 @@ def main():
         train_dataset, test_dataset = dataloader.build_dataset(
             data_root, mode='semi', seed=args.seed, imb_ratio=args.imb_ratio, use_strong_aug=use_strong_aug
         )
+    if args.debug:
+        from torch.utils.data import Subset
+        debug_train_size = min(64, len(train_dataset))
+        debug_test_size = min(32, len(test_dataset))
+        train_dataset = Subset(train_dataset, list(range(debug_train_size)))
+        test_dataset = Subset(test_dataset, list(range(debug_test_size)))
+        args.batch_size = min(args.batch_size, debug_train_size)
+        training_logger.info(f'[DEBUG] Reduced dataset: train={debug_train_size}, test={debug_test_size}, batch_size={args.batch_size}')
     training_logger.info(f"[{args.data}] Train size: {len(train_dataset)}")
     training_logger.info(f"[{args.data}] Test size:  {len(test_dataset)}")
-    training_logger.info(f"[{args.data}] Class Distribution (Train): {train_dataset.get_samples_per_cls()}")
+    _, samples_per_cls = dataloader.get_dataset_info(train_dataset)
+    training_logger.info(f"[{args.data}] Class Distribution (Train): {samples_per_cls}")
 
 
     # 데이터로더 생성
@@ -239,7 +274,7 @@ def main():
     cls_num_list, samples_per_cls = dataloader.get_dataset_info(train_dataset)
     
     # 손실 함수 생성
-    fusion_criterion, aux_criterion, mtm_criterion = create_loss_functions(args, cls_num_list, samples_per_cls, use_paco=args.use_paco, use_cb=args.use_cb, use_mtm=args.use_mtm)
+    paco_criterion, cb_criterion, mtm_criterion = create_loss_functions(args, cls_num_list, samples_per_cls, use_paco=args.use_paco, use_cb=args.use_cb, use_mtm=args.use_mtm)
 
     # ---------------------------------------------------
     # 3. 학습 루프
@@ -278,11 +313,16 @@ def main():
                 sensors_q = sensors.to(DEVICE)
                 sensors_k = sensors.to(DEVICE)
 
-                features_moco, target_moco, logits_moco, feature_concat, vision_feature, sensor_feature = model(
-                    im_q=images_q, im_k=images_k,
-                    sen_q=sensors_q, sen_k=sensors_k,
-                    labels=targets_int
-                )
+                if args.use_paco:
+                    features_moco, target_moco, logits_moco, logits_cl, vision_feature, sensor_feature = model(
+                        im_q=images_q, im_k=images_k,
+                        sen_q=sensors_q, sen_k=sensors_k,
+                        labels=targets_int
+                    )
+                else:
+                    # LateFusion: forward(x1, x2) -> (logits, feature_concat, vision_feat, sensor_feat)
+                    logits_moco, _, vision_feature, sensor_feature = model(images_q, sensors_q)
+                    features_moco, target_moco = None, None
                 
             elif args.modality == 'sensor':
                 sensors, targets = data
@@ -292,10 +332,14 @@ def main():
                 sensors_q = sensors.to(DEVICE)
                 sensors_k = sensors.to(DEVICE)
 
-                features_moco, target_moco, logits_moco, feature_concat, vision_feature, sensor_feature = model(
-                    sen_q=sensors_q, sen_k=sensors_k,
-                    labels=targets_int
-                )
+                if args.use_paco:
+                    features_moco, target_moco, logits_moco, logits_cl, vision_feature, sensor_feature = model(
+                        sen_q=sensors_q, sen_k=sensors_k,
+                        labels=targets_int
+                    )
+                else:
+                    logits_moco, _, vision_feature, sensor_feature = model(sensors_q)
+                    features_moco, target_moco = None, None
                 
             elif args.modality == 'vision':
                 images, targets = data
@@ -305,13 +349,20 @@ def main():
                 images_q = images[0].to(DEVICE)  # (B, 3, 224, 224)
                 images_k = images[1].to(DEVICE)
 
-                features_moco, target_moco, logits_moco, feature_concat, vision_feature, sensor_feature = model(
+                if args.use_paco:
+                    features_moco, target_moco, logits_moco, logits_cl, vision_feature, sensor_feature = model(
                     im_q=images_q, im_k=images_k,
                     labels=targets_int
-                )
+                    )
+                else:
+                    logits_moco, _, vision_feature, sensor_feature = model(images_q)
+                    features_moco, target_moco = None, None
 
-            pacoloss = fusion_criterion(features_moco, target_moco, logits_moco) if fusion_criterion is not None else torch.tensor(0.0, device=DEVICE)
-            celoss = aux_criterion(feature_concat, targets_oh) if aux_criterion is not None else torch.tensor(0.0, device=DEVICE)
+            pacoloss = paco_criterion(features_moco, target_moco, logits_moco) if paco_criterion is not None else torch.tensor(0.0, device=DEVICE)
+            if args.use_paco:
+                celoss = cb_criterion(logits_cl, targets_oh) if cb_criterion is not None else torch.tensor(0.0, device=DEVICE)
+            else:
+                celoss = cb_criterion(logits_moco, targets_oh) if cb_criterion is not None else torch.tensor(0.0, device=DEVICE)
             
             # MTMLoss 계산 (warmup 이후에만 text_emb 기반 MTM 사용)
             mtmloss = torch.tensor(0.0, device=DEVICE)
@@ -341,7 +392,7 @@ def main():
             correct   += pred_class.eq(gt_class).sum().item()
             total     += gt_class.size(0)
 
-            if (i+1) % 4 == 0:
+            if (i+1) % log_interval == 0:
                 celoss_value = celoss.item() if isinstance(celoss, torch.Tensor) else celoss
                 mtmloss_value = mtmloss.item() if isinstance(mtmloss, torch.Tensor) else mtmloss
                 training_logger.info(
@@ -364,28 +415,48 @@ def main():
                 if args.modality == 'fusion':
                     images, sensors, targets = data
                     target_oh = targets.float().to(DEVICE)
+                    targets_int = target_oh.argmax(dim=1)
                     images_q = images.to(DEVICE)
                     sensors_q = sensors.to(DEVICE)
 
-                    logit1, logit2 = model(im_q=images_q, sen_q=sensors_q)
+                    if args.use_paco:
+                        logit1, logit2 = model(im_q=images_q, sen_q=sensors_q)
+                        fusion_outputs = (logit1 + logit2) / 2
+                        vision_feature, sensor_feature = None, None
+                    else:
+                        out = model(images_q, sensors_q)
+                        fusion_outputs = out[0]  # LateFusion: (logits, feature_concat, vision_feat, sensor_feat)
+                        vision_feature, sensor_feature = out[2], out[3]
                     
                 elif args.modality == 'sensor':
                     sensors, targets = data
                     target_oh = targets.float().to(DEVICE)
+                    targets_int = target_oh.argmax(dim=1)
                     sensors_q = sensors.to(DEVICE)
-
                     logit1, logit2 = model(sen_q=sensors_q)
+                    fusion_outputs = (logit1 + logit2) / 2
+                    vision_feature, sensor_feature = None, None
                     
                 elif args.modality == 'vision':
                     images, targets = data
                     target_oh = targets.float().to(DEVICE)
+                    targets_int = target_oh.argmax(dim=1)
                     images_q = images.to(DEVICE)
-
                     logit1, logit2 = model(im_q=images_q)
-                
-                fusion_outputs = (logit1 + logit2) / 2
+                    fusion_outputs = (logit1 + logit2) / 2
+                    vision_feature, sensor_feature = None, None
 
-                batch_loss = nn.CrossEntropyLoss()(fusion_outputs, target_oh)
+                # 학습과 동일한 loss 공식 사용 (pacoloss는 eval 시 0)
+                celoss = cb_criterion(fusion_outputs, target_oh) if cb_criterion is not None else torch.tensor(0.0, device=DEVICE)
+                mtmloss = torch.tensor(0.0, device=DEVICE)
+                if mtm_criterion is not None and epoch >= args.textemb_warmup_epochs:
+                    if args.modality == 'fusion' and vision_feature is not None and sensor_feature is not None:
+                        mtmloss = mtm_criterion(vision_feature, sensor_feature, targets_int)
+                    elif args.modality == 'sensor' and sensor_feature is not None:
+                        mtmloss = mtm_criterion(None, sensor_feature, targets_int)
+                    elif args.modality == 'vision' and vision_feature is not None:
+                        mtmloss = mtm_criterion(vision_feature, None, targets_int)
+                batch_loss = args.lamb_ce_fusion * celoss + args.lamb_mtm_fusion * mtmloss
                 test_loss_val += batch_loss.item()
 
                 preds_list.append(m(fusion_outputs.cpu()))
@@ -396,6 +467,14 @@ def main():
         preds_cat = torch.cat(preds_list, dim=0)
         targets_cat = torch.cat(test_targets_list, dim=0)
         meter.update(model, preds_cat, targets_cat, epoch_test_loss, epoch)
+        if use_wandb:
+            wandb.log({
+                'train/loss': epoch_train_loss,
+                'train/acc': epoch_train_acc,
+                'val/loss': epoch_test_loss,
+                'val/acc': meter.test_acc_list[-1] * 100,
+                'epoch': epoch + 1,
+            })
         meter.plot_and_save(
             range(epoch+1), train_loss_list,
             'Epoch', 'Loss',
@@ -410,6 +489,9 @@ def main():
         )
 
         torch.save(model.state_dict(), os.path.join(save_path, 'last_model.pth'))
+
+    if use_wandb:
+        wandb.finish()
 
 if __name__ == '__main__':
     main()

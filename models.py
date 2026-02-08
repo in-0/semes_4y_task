@@ -311,7 +311,7 @@ class LateFusion(nn.Module):
         
         x = torch.cat((x1, x2), dim=1)
         x = self.add_layer(x)
-        return self.classifier(x), x, x1, x2
+        return self.classifier(x), x, x1, x2 # logits, feature_concat, vision_feat, sensor_feat
 
 def create_model(args, device):
     """모델을 생성하는 함수"""

@@ -329,25 +329,25 @@ def create_loss_functions(args, cls_num_list, samples_per_cls, use_paco=True, us
     """손실 함수들을 생성하는 함수"""
     # PaCoLoss 설정
     if use_paco:
-        fusion_criterion = PaCoLoss(
+        paco_criterion = PaCoLoss(
             alpha=args.alpha, beta=args.beta, gamma=args.gamma,
             temperature=args.moco_t, K=args.moco_k, num_classes=args.num_classes
         )
         
         # cls_num_list 설정
         if cls_num_list is not None:
-            fusion_criterion.cal_weight_for_classes(cls_num_list)
+            paco_criterion.cal_weight_for_classes(cls_num_list)
         else:
             # cls_num_list가 없는 경우 기본값 사용
-            fusion_criterion.cal_weight_for_classes([1, 1, 1, 1])  # 기본값
+            paco_criterion.cal_weight_for_classes([1, 1, 1, 1])  # 기본값
     else:
-        fusion_criterion = None
+        paco_criterion = None
     
     # CBLoss 설정
     if use_cb:
-        aux_criterion = CBLoss(samples_per_cls=samples_per_cls, no_of_classes=4, beta=0.9999, gamma=2)
+        cb_criterion = CBLoss(samples_per_cls=samples_per_cls, no_of_classes=4, beta=0.9999, gamma=2)
     else:
-        aux_criterion = None
+        cb_criterion = None
     
     # MTMLoss 설정
     if use_mtm:
@@ -355,4 +355,4 @@ def create_loss_functions(args, cls_num_list, samples_per_cls, use_paco=True, us
     else:
         mtm_criterion = None
     
-    return fusion_criterion, aux_criterion, mtm_criterion
+    return paco_criterion, cb_criterion, mtm_criterion

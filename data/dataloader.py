@@ -485,6 +485,9 @@ def get_dataset_info(train_dataset):
     else:
         # 원본 데이터셋인 경우
         original_dataset = train_dataset
+    # Subset인 경우 내부 dataset 사용 (debug 모드 등)
+    if hasattr(original_dataset, 'indices') and hasattr(original_dataset, 'dataset'):
+        original_dataset = original_dataset.dataset
     
     # cls_num_list 설정
     if hasattr(original_dataset, 'cls_num_list'):
