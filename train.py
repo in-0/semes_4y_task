@@ -310,11 +310,11 @@ def main():
                     labels=targets_int
                 )
 
-            pacoloss = fusion_criterion(features_moco, target_moco, logits_moco) if fusion_criterion is not None else torch.tensor(0.0).to(DEVICE)
-            celoss = aux_criterion(feature_concat, targets_oh) if aux_criterion is not None else torch.tensor(0.0).to(DEVICE)
+            pacoloss = fusion_criterion(features_moco, target_moco, logits_moco) if fusion_criterion is not None else torch.tensor(0.0, device=DEVICE)
+            celoss = aux_criterion(feature_concat, targets_oh) if aux_criterion is not None else torch.tensor(0.0, device=DEVICE)
             
             # MTMLoss 계산 (warmup 이후에만 text_emb 기반 MTM 사용)
-            mtmloss = torch.tensor(0.0).to(DEVICE)
+            mtmloss = torch.tensor(0.0, device=DEVICE)
             mtm_enabled = (mtm_criterion is not None) and (epoch >= args.textemb_warmup_epochs)
             if mtm_enabled:
                 if args.modality == 'fusion' and vision_feature is not None and sensor_feature is not None:

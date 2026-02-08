@@ -12,7 +12,7 @@ def save_pkl_data_as_png(pkl_file, output_dir):
 
     os.makedirs(output_dir, exist_ok=True)
 
-    for i, (img_data, _, _, base_name) in enumerate(tqdm(data, desc="Saving Heatmap PNGs", unit="image")):
+    for i, (img_data, _, _, base_name, *_) in enumerate(tqdm(data, desc="Saving Heatmap PNGs", unit="image")):
         # Load numpy array from .npy file
         img = np.load(img_data)  # (120,160)
 

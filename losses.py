@@ -288,7 +288,7 @@ class MTMLoss(nn.Module):
             sim_matrix: [batch_size, num_negatives] - similarity matrix
             pos_indices: list of (batch_idx, text_idx) tuples - positive pairs
             batch_size: batch size
-            num_negatives: number of negative samples
+            num_negatives: number of candidate text embeddings (positives+negatives)
             temperature: temperature parameter
         """
         if not pos_indices:
@@ -297,29 +297,26 @@ class MTMLoss(nn.Module):
         # temperature scaling
         sim_matrix = sim_matrix / temperature
         
-        # 각 sample에 대해 positive와 negative 분리
+        # 각 sample에 대해 multi-positive InfoNCE 계산
+        # loss_i = -log( sum_{p in P(i)} exp(s_ip) / sum_{a in A(i)} exp(s_ia) )
         losses = []
         for i in range(batch_size):
             # 현재 sample의 positive indices
             pos_indices_i = [j for batch_idx, j in pos_indices if batch_idx == i]
             if not pos_indices_i:
                 continue
-                
-            # positive logits
+
+            # positives: GT class에 해당하는 모든 prompt
             pos_logits = sim_matrix[i, pos_indices_i]  # [num_positives]
-            
-            # negative logits (positive가 아닌 모든 것)
-            neg_mask = torch.ones(num_negatives, dtype=torch.bool, device=sim_matrix.device)
-            neg_mask[pos_indices_i] = False
-            neg_logits = sim_matrix[i, neg_mask]  # [num_negatives]
-            
-            # InfoNCE loss 계산
-            logits = torch.cat([pos_logits, neg_logits])  # [num_positives + num_negatives]
-            
-            # InfoNCE loss: -log(exp(pos) / sum(exp(all)))
-            # 첫 번째가 positive sample이므로 target은 0
-            target = torch.zeros(1, dtype=torch.long, device=sim_matrix.device)
-            loss = F.cross_entropy(logits.unsqueeze(0), target)
+
+            # all candidates (positives + negatives)
+            all_logits = sim_matrix[i]  # [num_negatives]
+
+            # 안정적인 log-sum-exp 기반 multi-positive InfoNCE
+            # -log( sum exp(pos) / sum exp(all) ) = -(logsumexp(pos) - logsumexp(all))
+            log_num = torch.logsumexp(pos_logits, dim=0)
+            log_den = torch.logsumexp(all_logits, dim=0)
+            loss = -(log_num - log_den)
             losses.append(loss)
         
         if losses:

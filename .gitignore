@@ -75,8 +75,8 @@ GIT_WORKFLOW_GUIDE.md
 *.md
 
 # Config files (example_config.yaml 제외)
-configs/*.yaml
-!configs/example_config.yaml
+# configs/*.yaml
+# !configs/example_config.yaml
 
 # Train scripts (train.sh and train.py are tracked, but train_cuda*.sh are not)
 train_cuda*.sh

@@ -278,37 +278,38 @@ class LateFusion(nn.Module):
             if self.sensor_dimension_adapter is not None:
                 x2 = self.sensor_dimension_adapter(x2)
         
-        if self.use_textemb and self.training:
-            # text embeddings를 x1과 x2와 같은 device로 이동
-            text_embs = self.text_embs.to(x1.device)
+        # if self.use_textemb and self.training:
+        #     # text embeddings를 x1과 x2와 같은 device로 이동
+        #     text_embs = self.text_embs.to(x1.device)
             
-            # x1과 text_embs 간의 cosine similarity 계산
-            x1_similarities = F.cosine_similarity(
-                x1.unsqueeze(1),  # [batch_size, 1, 1024]
-                text_embs.unsqueeze(0),  # [1, num_classes, 1024]
-                dim=2
-            )
-            x2_similarities = F.cosine_similarity(
-                x2.unsqueeze(1),  # [batch_size, 1, 1024]
-                text_embs.unsqueeze(0),  # [1, num_classes, 1024]
-                dim=2
-            )  # [batch_size, num_classes]
+        #     # x1과 text_embs 간의 cosine similarity 계산
+        #     x1_similarities = F.cosine_similarity(
+        #         x1.unsqueeze(1),  # [batch_size, 1, 1024]
+        #         text_embs.unsqueeze(0),  # [1, num_classes, 1024]
+        #         dim=2
+        #     )
+        #     x2_similarities = F.cosine_similarity(
+        #         x2.unsqueeze(1),  # [batch_size, 1, 1024]
+        #         text_embs.unsqueeze(0),  # [1, num_classes, 1024]
+        #         dim=2
+        #     )  # [batch_size, num_classes]
             
-            # 각 샘플에 대해 가장 큰 similarity score만 사용
-            x1_sim_max = x1_similarities.max(dim=1)[0]  # [batch_size] - 가장 큰 similarity
-            x2_sim_max = x2_similarities.max(dim=1)[0]  # [batch_size] - 가장 큰 similarity
+        #     # 각 샘플에 대해 가장 큰 similarity score만 사용
+        #     x1_sim_max = x1_similarities.max(dim=1)[0]  # [batch_size] - 가장 큰 similarity
+        #     x2_sim_max = x2_similarities.max(dim=1)[0]  # [batch_size] - 가장 큰 similarity
             
-            # alpha 계산 (가장 큰 similarity를 기준으로)
-            alpha = x1_sim_max / (x1_sim_max + x2_sim_max + 1e-8)  # [batch_size]
-            alpha = alpha.unsqueeze(1)  # [batch_size, 1] - 브로드캐스팅을 위해 차원 추가
+        #     # alpha 계산 (가장 큰 similarity를 기준으로)
+        #     alpha = x1_sim_max / (x1_sim_max + x2_sim_max + 1e-8)  # [batch_size]
+        #     alpha = alpha.unsqueeze(1)  # [batch_size, 1] - 브로드캐스팅을 위해 차원 추가
             
-            # 가중치를 적용하여 fusion features 조정
-            x1_weighted = x1 + alpha * x1  # [batch_size, 1] * [batch_size, 1024] -> [batch_size, 1024]
-            x2_weighted = x2 + (1 - alpha) * x2  # [batch_size, 1] * [batch_size, 1024] -> [batch_size, 1024]
-            x = torch.cat((x1_weighted, x2_weighted), dim=1)
-        else:
-            x = torch.cat((x1, x2), dim=1)
+        #     # 가중치를 적용하여 fusion features 조정
+        #     x1_weighted = x1 + alpha * x1  # [batch_size, 1] * [batch_size, 1024] -> [batch_size, 1024]
+        #     x2_weighted = x2 + (1 - alpha) * x2  # [batch_size, 1] * [batch_size, 1024] -> [batch_size, 1024]
+        #     x = torch.cat((x1_weighted, x2_weighted), dim=1)
+        # else:
+        #     x = torch.cat((x1, x2), dim=1)
         
+        x = torch.cat((x1, x2), dim=1)
         x = self.add_layer(x)
         return self.classifier(x), x, x1, x2
 

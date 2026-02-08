@@ -9,7 +9,12 @@ def fix_pkl_paths(pkl_file, output_pkl, mode):
         data = pickle.load(f)
 
     fixed_data = []
-    for img_data, sensor_values, target, base_name in tqdm(data, desc="Fixing PKL Paths", unit="entry"):
+    for item in tqdm(data, desc="Fixing PKL Paths", unit="entry"):
+        # pkl 포맷 호환:
+        # - 기존: (img_data, sensor_values, target, base_name)
+        # - 신규: (img_data, sensor_values, target, base_name, mtf_path)
+        img_data, sensor_values, target, base_name, *rest = item
+        mtf_path = rest[0] if rest else None
         # 🔹 경로 수정
         if "data/semi/val/raw" in img_data and mode == "train":
             corrected_img_data = img_data.replace("data/semi/val/raw", "data/semi/train/raw")
@@ -18,7 +23,14 @@ def fix_pkl_paths(pkl_file, output_pkl, mode):
         else:
             corrected_img_data = img_data  # 이미 올바르면 그대로 유지
 
-        fixed_data.append((corrected_img_data, sensor_values, target, base_name))
+        corrected_mtf = None
+        if isinstance(mtf_path, str):
+            corrected_mtf = mtf_path
+            if "data/semi/val/raw" in corrected_mtf and mode == "train":
+                corrected_mtf = corrected_mtf.replace("data/semi/val/raw", "data/semi/train/raw")
+            elif "data/semi/train/raw" in corrected_mtf and mode == "val":
+                corrected_mtf = corrected_mtf.replace("data/semi/train/raw", "data/semi/val/raw")
+        fixed_data.append((corrected_img_data, sensor_values, target, base_name, corrected_mtf))
 
     # 수정된 데이터를 새로운 pkl 파일로 저장
     with open(output_pkl, 'wb') as f:

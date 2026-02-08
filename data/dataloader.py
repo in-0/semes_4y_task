@@ -356,7 +356,11 @@ class SEMIDataset(Dataset):
         return counts
 
     def __getitem__(self, index):
-        img_data, sensor, _int_label, _ = self.data[index]
+        item = self.data[index]
+        # pkl 포맷 호환:
+        # - 기존: (img_data, sensor, int_label, base_name)
+        # - 신규: (img_data, sensor, int_label, base_name, mtf_path)
+        img_data, sensor, _int_label, _base_name, *_rest = item
         img = np.load(img_data)  # (120,160)
         # float64일 경우 uint8로 변환
         if img.dtype == np.float64:
@@ -376,7 +380,8 @@ class SEMIDataset(Dataset):
 
     def get_image_only(self, index):
         """이미지만 반환하는 메서드"""
-        img_data, _, _, _ = self.data[index]
+        item = self.data[index]
+        img_data, *_ = item
         img = np.load(img_data)
         # float64일 경우 uint8로 변환
         if img.dtype == np.float64:
@@ -392,7 +397,8 @@ class SEMIDataset(Dataset):
     
     def get_sensor_only(self, index):
         """센서 데이터만 반환하는 메서드"""
-        _, sensor, _, _ = self.data[index]
+        item = self.data[index]
+        _, sensor, *_ = item
         sensor = (np.array(sensor) - self.sensor_mean) / (self.sensor_std + 1e-8)
         return torch.tensor(sensor, dtype=torch.float32)
     
