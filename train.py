@@ -29,6 +29,7 @@ parser.add_argument('--num_epochs', type=int, default=30, help='Number of epochs
 parser.add_argument('--scheduler', type=str, choices=['default', 'step', 'cosine'], default='cosine', help='Choose Scheduler')
 parser.add_argument('--step_size', type=int, default=8, help='Step size for learning rate scheduler')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+parser.add_argument('--weight_decay', type=float, default=5e-4, help='AdamW weight decay (L2 regularization)')
 parser.add_argument('--num_layers', type=int, default=5, help='Number of the sensor backbone layers')
 parser.add_argument('--dim', type=int, default=128, help='Model inner dimension')
 parser.add_argument('--imb_ratio', type=float, default=0.02, help='imbalance ratio')

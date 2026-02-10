@@ -390,22 +390,34 @@ class PrimaryNetworkWithHyperLayers(nn.Module):
 
 
 class SelfAttentionFusionHead(nn.Module):
-    """Single vector를 토큰 시퀀스로 나눈 뒤 self-attention(Transformer) 적용."""
+    """
+    Single vector를 토큰 시퀀스로 나눈 뒤 self-attention 적용.
+    F.scaled_dot_product_attention 사용 → Flash Attention 등 효율 백엔드 자동 선택.
+    """
     def __init__(self, dim=1024, num_heads=8, num_tokens=16, dropout=0.2):
         super(SelfAttentionFusionHead, self).__init__()
         assert dim % num_tokens == 0, "dim must be divisible by num_tokens"
         self.num_tokens = num_tokens
         self.token_dim = dim // num_tokens
+        self.num_heads = num_heads
+        assert self.token_dim % num_heads == 0, "token_dim must be divisible by num_heads"
+        self.head_dim = self.token_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.dropout_p = dropout
+
         self.pre_norm = nn.LayerNorm(dim)
-        self.transformer = nn.TransformerEncoderLayer(
-            d_model=self.token_dim,
-            nhead=num_heads,
-            dim_feedforward=max(256, self.token_dim * 2),
-            dropout=dropout,
-            activation='relu',
-            batch_first=True,
-            norm_first=False,
+        # QKV 한 번에 (연산/메모리 효율)
+        self.qkv = nn.Linear(self.token_dim, 3 * self.token_dim)
+        self.attn_out = nn.Linear(self.token_dim, self.token_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(self.token_dim, max(256, self.token_dim * 2)),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(max(256, self.token_dim * 2), self.token_dim),
+            nn.Dropout(dropout),
         )
+        self.norm1 = nn.LayerNorm(self.token_dim)
+        self.norm2 = nn.LayerNorm(self.token_dim)
         self.post_norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -413,7 +425,18 @@ class SelfAttentionFusionHead(nn.Module):
         B = x.size(0)
         x = self.pre_norm(x)
         x = x.view(B, self.num_tokens, self.token_dim)
-        x = self.transformer(x)
+        # Self-attention with SDPA (flash / memory_efficient 백엔드 자동 사용)
+        residual = x
+        qkv = self.qkv(x)
+        qkv = qkv.reshape(B, self.num_tokens, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn_out = F.scaled_dot_product_attention(q, k, v, scale=self.scale, dropout_p=self.dropout_p)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, self.num_tokens, self.token_dim)
+        x = residual + self.dropout(self.attn_out(attn_out))
+        x = self.norm1(x)
+        x = x + self.ffn(x)
+        x = self.norm2(x)
         x = x.reshape(B, -1)
         x = self.post_norm(x)
         return self.dropout(x)
@@ -567,7 +590,8 @@ def create_optimizer_and_scheduler(model, args):
     import torch.optim as optim
     
     # 옵티마이저
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
+    weight_decay = getattr(args, 'weight_decay', 5e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
 
     # 스케줄러
     if args.scheduler == 'default':
@@ -575,6 +599,6 @@ def create_optimizer_and_scheduler(model, args):
     elif args.scheduler == 'step':
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=0.1)
     elif args.scheduler == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=0)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
     
     return optimizer, scheduler
