@@ -192,13 +192,15 @@ class VisionTextFusion(nn.Module):
 
 # Fusion model that combine the vision and sensor model
 class LateFusion(nn.Module):
-    def __init__(self, vision_model, sensor_model, dim, num_classes=4, use_textemb=False, use_dim_matching_layer=False):
+    def __init__(self, vision_model, sensor_model, dim, num_classes=4, use_textemb=False, use_dim_matching_layer=False, use_gated_fusion=False):
         super(LateFusion, self).__init__()
         self.vision_model = vision_model
         self.sensor_model = sensor_model
         self.num_classes = num_classes
         self.dim = dim
         self.use_dim_matching_layer = use_dim_matching_layer
+        # 가중 결합은 두 모달리티가 동일 차원(1024)일 때만 적용
+        self.use_gated_fusion = use_gated_fusion and use_dim_matching_layer
         
         # use_textemb는 use_dim_matching_layer가 있을 경우에만 사용 가능
         if use_textemb and not use_dim_matching_layer:
@@ -258,12 +260,31 @@ class LateFusion(nn.Module):
             self.register_buffer('text_embs', text_embs)
 
         self.fusion_dim = fusion_dim
-        linear_add = nn.Linear(fusion_dim, fusion_dim)
-        norm_add = nn.BatchNorm1d(fusion_dim)
-        self.add_layer = nn.Sequential(linear_add, norm_add, nn.ReLU())
+        # 가중 결합(Gated fusion): gate = sigmoid(W·[v;s]), fused = gate*v + (1-gate)*s (use_dim_matching_layer일 때만 유효)
+        if self.use_gated_fusion:
+            # x1, x2 각 1024 → concat 2048 → gate 1024
+            self.gate_layer = nn.Linear(fusion_dim, 1024)
+            head_input_dim = 1024  # fused vector 차원
+        else:
+            self.gate_layer = None
+            head_input_dim = fusion_dim
+
+        # Fusion head: 2-layer MLP + Dropout (강화)
+        hidden1, hidden2 = 1024, 512
+        self.add_layer = nn.Sequential(
+            nn.Linear(head_input_dim, hidden1),
+            nn.BatchNorm1d(hidden1),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(hidden1, hidden2),
+            nn.BatchNorm1d(hidden2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+        )
+        self.fusion_head_out_dim = hidden2  # classifier 입력 차원 (PaCo 등에서 feat_dim으로 사용)
         self.norm1 = nn.BatchNorm1d(1280)  # multimodal
         self.norm2 = nn.BatchNorm1d(dim)
-        self.classifier = nn.Linear(fusion_dim, num_classes)  # multimodal
+        self.classifier = nn.Linear(hidden2, num_classes)  # multimodal
 
     def forward(self, x1, x2):
         _, x1 = self.vision_model(x1)
@@ -309,36 +330,205 @@ class LateFusion(nn.Module):
         # else:
         #     x = torch.cat((x1, x2), dim=1)
         
-        x = torch.cat((x1, x2), dim=1)
+        if self.use_gated_fusion and self.gate_layer is not None:
+            # 가중 결합: gate = sigmoid(W·[v;s]), fused = gate*v + (1-gate)*s
+            gate = torch.sigmoid(self.gate_layer(torch.cat((x1, x2), dim=1)))
+            x = gate * x1 + (1 - gate) * x2  # [B, 1024]
+        else:
+            x = torch.cat((x1, x2), dim=1)
         x = self.add_layer(x)
         return self.classifier(x), x, x1, x2 # logits, feature_concat, vision_feat, sensor_feat
+
+
+# ---------------------------------------------------------------------------
+# Hypernetwork Fusion: 병렬 DNN 4개(각각 2층)가 Primary 4층의 W,b 생성
+# ---------------------------------------------------------------------------
+
+class Hypernetwork(nn.Module):
+    """
+    병렬 DNN 4개: 각 DNN은 1층(Linear -> ReLU)만 사용.
+    sensor → (hidden) → (out*in + out) → reshape → (W_i, b_i).
+    """
+    def __init__(self, sensor_in_dim, layer_specs):
+        super(Hypernetwork, self).__init__()
+        self.layer_specs = layer_specs
+        self.act = nn.ReLU(inplace=True)
+        self.dnn_fc1 = nn.ModuleList()
+        for in_d, out_d in layer_specs:
+            self.dnn_fc1.append(nn.Linear(sensor_in_dim, in_d*out_d + out_d))
+
+    def forward(self, sensor):
+        sensor = sensor.float()
+        weights_biases = []
+        for i, (in_d, out_d) in enumerate(self.layer_specs):
+            h = self.act(self.dnn_fc1[i](sensor))  # (B, hidden_dim)
+            w = h[:, :in_d * out_d].view(-1, in_d, out_d)  # (B, in_d, out_d)
+            b = h[:, in_d * out_d:]
+            weights_biases.append((w, b))
+        return None, weights_biases
+
+
+class PrimaryNetworkWithHyperLayers(nn.Module):
+    """
+    Primary network. 모든 층이 하이퍼네트워크가 생성한 W, b로만 구성. 레이어마다 ReLU 후 dropout 적용 가능.
+    """
+    def __init__(self, primary_dims, dropout=0.0):
+        super(PrimaryNetworkWithHyperLayers, self).__init__()
+        self.primary_dims = primary_dims
+        self.act = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x, weights_biases):
+        """x: (B, primary_dims[0])"""
+        num_layers = len(self.primary_dims) - 1
+        for i in range(num_layers):
+            w, b = weights_biases[i]
+            x = torch.bmm(x.unsqueeze(1), w).squeeze(1) + b
+            x = self.act(x)
+            x = self.dropout(x)
+        return x
+
+
+class SelfAttentionFusionHead(nn.Module):
+    """Single vector를 토큰 시퀀스로 나눈 뒤 self-attention(Transformer) 적용."""
+    def __init__(self, dim=1024, num_heads=8, num_tokens=16, dropout=0.2):
+        super(SelfAttentionFusionHead, self).__init__()
+        assert dim % num_tokens == 0, "dim must be divisible by num_tokens"
+        self.num_tokens = num_tokens
+        self.token_dim = dim // num_tokens
+        self.pre_norm = nn.LayerNorm(dim)
+        self.transformer = nn.TransformerEncoderLayer(
+            d_model=self.token_dim,
+            nhead=num_heads,
+            dim_feedforward=max(256, self.token_dim * 2),
+            dropout=dropout,
+            activation='relu',
+            batch_first=True,
+            norm_first=False,
+        )
+        self.post_norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B = x.size(0)
+        x = self.pre_norm(x)
+        x = x.view(B, self.num_tokens, self.token_dim)
+        x = self.transformer(x)
+        x = x.reshape(B, -1)
+        x = self.post_norm(x)
+        return self.dropout(x)
+
+
+class LateFusionHypernetwork(nn.Module):
+    """
+    병렬 DNN 4개(각 2층) → 기존 Primary dims에 맞는 W,b 생성.
+    LateFusion과 동일한 forward: (x1, x2) -> (logits, feature_concat, vision_feat, sensor_feat)
+    """
+    def __init__(self, vision_model, sensor_in_dim, num_classes=4,
+                 primary_dims=None,
+                 fusion_target_dim=1024,
+                 primary_dropout=0.0):
+        super(LateFusionHypernetwork, self).__init__()
+        self.vision_model = vision_model
+        self.num_classes = num_classes
+        # Primary layer 개수(=len(primary_dims)-1)에 맞춰 병렬 DNN 개수도 자동으로 매칭
+        primary_dims = primary_dims or [1280, 1024, 1024, 1024, 512]
+        if not isinstance(primary_dims, (list, tuple)) or len(primary_dims) < 2:
+            primary_dims = [1280, 1024, 1024, 1024, 512]
+        # layer_specs: (in_dim, out_dim) for each Primary layer (총 len(primary_dims)-1개)
+        layer_specs = [(primary_dims[i], primary_dims[i + 1]) for i in range(len(primary_dims) - 1)]
+        self.hypernetwork = Hypernetwork(sensor_in_dim=sensor_in_dim, layer_specs=layer_specs)
+        self.primary_net = PrimaryNetworkWithHyperLayers(primary_dims=primary_dims, dropout=primary_dropout)
+        primary_out_dim = primary_dims[-1]
+
+        # 센서는 이미 Primary의 W,b로 img에 반영됨 → primary 출력만 사용 (sensor concat/gate 제거)
+        self.primary_adapter = nn.Sequential(
+            nn.Linear(primary_out_dim, fusion_target_dim),
+            nn.BatchNorm1d(fusion_target_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        # add_layer: self-attention (feature를 토큰 시퀀스로 쪼갠 뒤 Transformer) → 출력 1024
+        self.add_layer = SelfAttentionFusionHead(
+            dim=fusion_target_dim,
+            num_heads=8,
+            num_tokens=16,
+            dropout=0.2,
+        )
+        self.fusion_head_out_dim = fusion_target_dim
+        self.classifier = nn.Linear(fusion_target_dim, num_classes)
+        self.norm_vision = nn.BatchNorm1d(1280)
+
+    def forward(self, x1, x2):
+        _, img_feat = self.vision_model(x1)
+        img_feat = self.norm_vision(img_feat)
+
+        _, weights_biases = self.hypernetwork(x2)
+        primary_feat = self.primary_net(img_feat, weights_biases)
+
+        x = self.primary_adapter(primary_feat)
+        x = self.add_layer(x)
+        logits = self.classifier(x)
+        return logits, x, x, None  # vision_feat=fusion for HNMTMLoss
+
+
+def _parse_hypernetwork_dims(s):
+    """'1280,1024,1024,512' -> [1280, 1024, 1024, 512]"""
+    if s is None or (isinstance(s, str) and not s.strip()):
+        return None
+    if isinstance(s, (list, tuple)):
+        return list(s)
+    return [int(x.strip()) for x in str(s).split(',') if x.strip()]
+
+
+def _parse_hypernetwork_external(s):
+    """'1,2' -> [1, 2]"""
+    if s is None or (isinstance(s, str) and not s.strip()):
+        return None
+    if isinstance(s, (list, tuple)):
+        return list(s)
+    return [int(x.strip()) for x in str(s).split(',') if x.strip()]
+
 
 def create_model(args, device):
     """모델을 생성하는 함수"""
     if args.modality == 'fusion':
-        # 기존 fusion 모델
         vision_model = MobileNetV2CAE(num_classes=args.num_classes, pretrained=True, freeze_until=15).to(device)
         vision_model2 = MobileNetV2CAE(num_classes=args.num_classes, pretrained=True, freeze_until=15).to(device)
-        if args.data == 'gdcm':
-            sensor_model = DNN(in_dim=7, num_layers=5, num_classes=4, dim=128, skip_connection=True)
-            sensor_model2 = DNN(in_dim=7, num_layers=5, num_classes=4, dim=128, skip_connection=True)
-        elif args.data == 'sms':
-            sensor_model = DNN(in_dim=8, num_layers=5, num_classes=4, dim=128, skip_connection=True)
-            sensor_model2 = DNN(in_dim=8, num_layers=5, num_classes=4, dim=128, skip_connection=True)
 
-        # fusion_type에 따라 다른 fusion 모델 사용
-        fusion_model = LateFusion(vision_model, sensor_model, dim=args.dim, use_textemb=args.use_textemb, use_dim_matching_layer=args.use_dim_matching_layer).to(device)
-        fusion_model2 = LateFusion(vision_model2, sensor_model2, dim=args.dim, use_textemb=args.use_textemb, use_dim_matching_layer=args.use_dim_matching_layer).to(device)
-        
-        # use_dim_matching_layer가 있을 때 feat_dim 계산
-        if args.use_dim_matching_layer:
-            target_dim = 1024
-            feat_dim = target_dim * 2  # vision(1024) + sensor(1024)
+        use_hypernetwork_fusion = getattr(args, 'use_hypernetwork_fusion', False)
+        use_gated_fusion = getattr(args, 'use_gated_fusion', False)
+
+        if use_hypernetwork_fusion:
+            sensor_in_dim = 8 if args.data == 'sms' else 7
+            primary_dims = _parse_hypernetwork_dims(getattr(args, 'hypernetwork_primary_dims', None)) or [1280, 1024, 1024, 1024, 512]
+            if not isinstance(primary_dims, (list, tuple)) or len(primary_dims) < 2:
+                primary_dims = [1280, 1024, 1024, 1024, 512]
+
+            primary_dropout = getattr(args, 'hypernetwork_primary_dropout', 0.0)
+            fusion_model = LateFusionHypernetwork(
+                vision_model, sensor_in_dim, num_classes=args.num_classes,
+                primary_dims=primary_dims,
+                fusion_target_dim=getattr(args, 'hypernetwork_fusion_target_dim', 1024),
+                primary_dropout=primary_dropout).to(device)
+            fusion_model2 = LateFusionHypernetwork(
+                vision_model2, sensor_in_dim, num_classes=args.num_classes,
+                primary_dims=primary_dims,
+                fusion_target_dim=getattr(args, 'hypernetwork_fusion_target_dim', 1024),
+                primary_dropout=primary_dropout).to(device)
         else:
-            feat_dim = args.feat_dim
-        
+            if args.data == 'gdcm':
+                sensor_model = DNN(in_dim=7, num_layers=5, num_classes=4, dim=128, skip_connection=True)
+                sensor_model2 = DNN(in_dim=7, num_layers=5, num_classes=4, dim=128, skip_connection=True)
+            elif args.data == 'sms':
+                sensor_model = DNN(in_dim=8, num_layers=5, num_classes=4, dim=128, skip_connection=True)
+                sensor_model2 = DNN(in_dim=8, num_layers=5, num_classes=4, dim=128, skip_connection=True)
+            fusion_model = LateFusion(vision_model, sensor_model, dim=args.dim, use_textemb=args.use_textemb, use_dim_matching_layer=args.use_dim_matching_layer, use_gated_fusion=use_gated_fusion).to(device)
+            fusion_model2 = LateFusion(vision_model2, sensor_model2, dim=args.dim, use_textemb=args.use_textemb, use_dim_matching_layer=args.use_dim_matching_layer, use_gated_fusion=use_gated_fusion).to(device)
+
+        feat_dim = fusion_model.fusion_head_out_dim
         if args.use_paco:
-            model = Moco_fusion_mm.MoCo(query_encoder=fusion_model, key_encoder=fusion_model2, modality=args.modality, feat_dim=feat_dim, use_dim_matching_layer=args.use_dim_matching_layer, m=args.moco_m, T=args.moco_t, K=args.moco_k)
+            model = Moco_fusion_mm.MoCo(query_encoder=fusion_model, key_encoder=fusion_model2, modality=args.modality, feat_dim=feat_dim, use_dim_matching_layer=getattr(args, 'use_dim_matching_layer', False) or use_hypernetwork_fusion, m=args.moco_m, T=args.moco_t, K=args.moco_k)
         else:
             model = fusion_model
         

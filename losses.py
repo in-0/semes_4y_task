@@ -144,12 +144,13 @@ class CBLoss(nn.Module):
 
 class MTMLoss(nn.Module):
     """Modality-Text Matching Loss"""
-    def __init__(self, num_classes=4, lambda_weight=0.5, text_emb_path='./semi_text_embs/merged_text_embeddings.pth'):
+    def __init__(self, num_classes=4, lambda_weight=0.5, use_l_agree=True, text_emb_path='./semi_text_embs/merged_text_embeddings.pth'):
         super(MTMLoss, self).__init__()
         self.num_classes = num_classes
         self.lambda_weight = lambda_weight
         self.class_name = ['normal', 'caution', 'warning', 'critical']
-        
+        self.use_l_agree = use_l_agree
+
         # text embeddings 불러오기
         try:
             text_embeddings_dict = torch.load(text_emb_path)
@@ -180,8 +181,8 @@ class MTMLoss(nn.Module):
     def forward(self, img_feat, sen_feat, gt_labels):
         """
         Args:
-            img_feat: [batch_size, dim_feat] - image features (can be None for sensor-only)
-            sen_feat: [batch_size, dim_feat] - sensor features (can be None for vision-only)
+            img_feat: [batch_size, dim_feat] - image features
+            sen_feat: [batch_size, dim_feat] - sensor features
             gt_labels: [batch_size] - ground truth class labels
         """
         batch_size = gt_labels.size(0)
@@ -264,14 +265,17 @@ class MTMLoss(nn.Module):
             sim_matrix_sen = torch.matmul(sen_feat_norm, text_embs_norm.T)  # [batch_size, num_classes * num_prompts]
             L2 = self._info_nce_loss(sim_matrix_sen, pos_indices, batch_size, num_classes * num_prompts)
             
-            # L_agree = abs(cos(img_feat,text_emb) - cos(sen_feat,text_emb)) 계산 (GT class만)
-            gt_text_embs = text_embs[gt_labels]  # [batch_size, num_prompts, dim_feat]
-            img_feat_expanded = img_feat.unsqueeze(1).expand(-1, num_prompts, -1)  # [batch_size, num_prompts, dim_feat]
-            sen_feat_expanded = sen_feat.unsqueeze(1).expand(-1, num_prompts, -1)  # [batch_size, num_prompts, dim_feat]
-            
-            cos_img_text = F.cosine_similarity(img_feat_expanded, gt_text_embs, dim=2)  # [batch_size, num_prompts]
-            cos_sen_text = F.cosine_similarity(sen_feat_expanded, gt_text_embs, dim=2)  # [batch_size, num_prompts]
-            L_agree = torch.abs(cos_img_text.mean(dim=1) - cos_sen_text.mean(dim=1))  # [batch_size]
+            if self.use_l_agree:
+                # L_agree = abs(cos(img_feat,text_emb) - cos(sen_feat,text_emb)) 계산 (GT class만)
+                gt_text_embs = text_embs[gt_labels]  # [batch_size, num_prompts, dim_feat]
+                img_feat_expanded = img_feat.unsqueeze(1).expand(-1, num_prompts, -1)  # [batch_size, num_prompts, dim_feat]
+                sen_feat_expanded = sen_feat.unsqueeze(1).expand(-1, num_prompts, -1)  # [batch_size, num_prompts, dim_feat]
+                
+                cos_img_text = F.cosine_similarity(img_feat_expanded, gt_text_embs, dim=2)  # [batch_size, num_prompts]
+                cos_sen_text = F.cosine_similarity(sen_feat_expanded, gt_text_embs, dim=2)  # [batch_size, num_prompts]
+                L_agree = torch.abs(cos_img_text.mean(dim=1) - cos_sen_text.mean(dim=1))  # [batch_size]
+            else:
+                L_agree = torch.zeros_like(L1)
         
         # lambda*L1 + (1-lambda)*L2 계산
         weighted_loss = self.lambda_weight * L1 + (1 - self.lambda_weight) * L2
@@ -325,10 +329,90 @@ class MTMLoss(nn.Module):
             return torch.tensor(0.0, device=sim_matrix.device)
 
 
-def create_loss_functions(args, cls_num_list, samples_per_cls, use_paco=True, use_cb=True, use_mtm=False):
+class HNMTMLoss(nn.Module):
+    """
+    Hypernetwork Fusion용: fusion feature만 입력받아 text embeddings와 alignment.
+    (MTMLoss와 동일한 text 로딩·InfoNCE 방식, 단일 입력 fusion_feat만 사용)
+    """
+    def __init__(self, num_classes=4, text_emb_path='./semi_text_embs/merged_text_embeddings.pth'):
+        super(HNMTMLoss, self).__init__()
+        self.num_classes = num_classes
+        self.class_name = ['normal', 'caution', 'warning', 'critical']
+
+        try:
+            text_embeddings_dict = torch.load(text_emb_path)
+            max_prompts = max([feat.shape[0] if feat.dim() > 1 else 1 for feat in text_embeddings_dict.values()])
+            text_embs = torch.zeros(num_classes, max_prompts, 1024)
+            for idx, name in enumerate(self.class_name):
+                if name in text_embeddings_dict:
+                    feat = text_embeddings_dict[name]
+                    if feat.dim() == 1:
+                        feat = feat.unsqueeze(0)
+                    text_embs[idx, :feat.shape[0], :] = feat
+                else:
+                    print(f"Warning: class {name} not found in text embeddings, using random embedding")
+                    text_embs[idx] = torch.randn(max_prompts, 1024)
+            print(f"Loaded text embeddings for HNMTMLoss with shape: {text_embs.shape}")
+        except FileNotFoundError:
+            print("Warning: ./semi_text_embs/merged_text_embeddings.pth not found. Using random embeddings.")
+            text_embs = torch.randn(num_classes, 10, 1024)
+        except Exception as e:
+            print(f"Error loading text embeddings: {e}")
+            text_embs = torch.randn(num_classes, 10, 1024)
+
+        self.register_buffer('text_embs', text_embs)
+
+    def forward(self, fusion_feat, gt_labels):
+        """
+        Args:
+            fusion_feat: [batch_size, dim_feat] - fusion feature (1024)
+            gt_labels: [batch_size] - ground truth class labels
+        """
+        batch_size = gt_labels.size(0)
+        device = gt_labels.device
+
+        text_embs = self.text_embs.to(device)
+        num_classes, num_prompts, dim_feat = text_embs.shape
+
+        fusion_feat_norm = F.normalize(fusion_feat, dim=1)
+        text_embs_flat = text_embs.view(-1, dim_feat)
+        text_embs_norm = F.normalize(text_embs_flat, dim=1)
+
+        sim_matrix = torch.matmul(fusion_feat_norm, text_embs_norm.T)
+
+        pos_indices = []
+        for i, gt_label in enumerate(gt_labels):
+            start_idx = gt_label.item() * num_prompts
+            end_idx = (gt_label.item() + 1) * num_prompts
+            pos_indices.extend([(i, j) for j in range(start_idx, end_idx)])
+
+        loss = self._info_nce_loss(sim_matrix, pos_indices, batch_size, num_classes * num_prompts)
+        return loss
+
+    def _info_nce_loss(self, sim_matrix, pos_indices, batch_size, num_negatives, temperature=0.07):
+        if not pos_indices:
+            return torch.tensor(0.0, device=sim_matrix.device)
+        sim_matrix = sim_matrix / temperature
+        losses = []
+        for i in range(batch_size):
+            pos_indices_i = [j for batch_idx, j in pos_indices if batch_idx == i]
+            if not pos_indices_i:
+                continue
+            pos_logits = sim_matrix[i, pos_indices_i]
+            all_logits = sim_matrix[i]
+            log_num = torch.logsumexp(pos_logits, dim=0)
+            log_den = torch.logsumexp(all_logits, dim=0)
+            loss = -(log_num - log_den)
+            losses.append(loss)
+        if losses:
+            return torch.stack(losses).mean()
+        return torch.tensor(0.0, device=sim_matrix.device)
+
+
+def create_loss_functions(args, cls_num_list, samples_per_cls):
     """손실 함수들을 생성하는 함수"""
     # PaCoLoss 설정
-    if use_paco:
+    if args.use_paco:
         paco_criterion = PaCoLoss(
             alpha=args.alpha, beta=args.beta, gamma=args.gamma,
             temperature=args.moco_t, K=args.moco_k, num_classes=args.num_classes
@@ -344,15 +428,17 @@ def create_loss_functions(args, cls_num_list, samples_per_cls, use_paco=True, us
         paco_criterion = None
     
     # CBLoss 설정
-    if use_cb:
+    if args.use_cb:
         cb_criterion = CBLoss(samples_per_cls=samples_per_cls, no_of_classes=4, beta=0.9999, gamma=2)
     else:
         cb_criterion = None
     
     # MTMLoss 설정
-    if use_mtm:
-        mtm_criterion = MTMLoss(num_classes=args.num_classes, lambda_weight=args.mtm_lambda)
+    if args.use_mtm and args.use_hypernetwork_fusion:
+        mtm_criterion = HNMTMLoss(num_classes=args.num_classes)
+    elif args.use_mtm:
+        mtm_criterion = MTMLoss(num_classes=args.num_classes, lambda_weight=args.mtm_lambda, use_l_agree=args.mtm_use_l_agree)
     else:
         mtm_criterion = None
-    
+
     return paco_criterion, cb_criterion, mtm_criterion

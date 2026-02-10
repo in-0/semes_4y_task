@@ -37,7 +37,12 @@ parser.add_argument('--data', type=str, choices=['gdcm', 'sms'], default='gdcm',
 parser.add_argument('--modality', type=str, choices=['fusion', 'sensor', 'vision'], default='fusion', help='Choose modality: fusion, sensor only, or vision only')
 parser.add_argument('--use_textemb', action='store_true', help='Use text embeddings for similarity-based weighting in LateFusion')
 parser.add_argument('--use_dim_matching_layer', action='store_true', help='Use dimension matching layer in LateFusion (target_dim=1024)')
+parser.add_argument('--use_gated_fusion', action='store_true', help='Use gated fusion (gate*v + (1-gate)*s) in LateFusion; only effective when use_dim_matching_layer is True')
 parser.add_argument('--textemb_warmup_epochs', type=int, default=0, help='Number of warmup epochs without text embeddings (only after this epoch textemb is enabled)')
+
+# Hypernetwork fusion (sensor → W,b for primary network layers)
+parser.add_argument('--use_hypernetwork_fusion', action='store_true', help='Use hypernetwork fusion: sensor DNNs generate weights/biases for part of primary network layers on img features')
+parser.add_argument('--hypernetwork_primary_dropout', type=float, default=0.0, help='Dropout after each Primary network layer (0=off)')
 
 # args for Paco
 parser.add_argument('--alpha', default=0.1, type=float, help='contrast weight among samples')
@@ -52,6 +57,7 @@ parser.add_argument('--lamb_paco_fusion', type=float, default=1.0, help='paco lo
 parser.add_argument('--lamb_ce_fusion', type=float, default=1.0, help='ce loss factor for fusion')
 parser.add_argument('--lamb_mtm_fusion', type=float, default=1.0, help='mtm loss factor for fusion')
 parser.add_argument('--mtm_lambda', type=float, default=0.5, help='lambda weight for mtm loss')
+parser.add_argument('--mtm_use_l_agree', action='store_true', help='Use L_agree in MTMLoss')
 
 # args for loss functions
 parser.add_argument('--use_paco', action='store_true', help='Use PaCoLoss')
@@ -194,9 +200,9 @@ def main():
     if args.debug:
         training_logger.info('*** DEBUG MODE: num_epochs=1, reduced dataset, log every step ***')
 
-    # wandb 초기화
+    # wandb 초기화 (`--debug` 모드에서는 강제로 비활성화)
     use_wandb = False
-    if args.wandb:
+    if args.wandb and not args.debug:
         try:
             import wandb
             wandb.init(project='semes_exp', config=config_dict, name=args.comment)
@@ -204,6 +210,8 @@ def main():
             training_logger.info('W&B experiment tracking enabled')
         except ImportError:
             training_logger.warning('wandb not installed. Run: pip install wandb')
+    elif args.wandb and args.debug:
+        training_logger.info('W&B flag is set but disabled in DEBUG mode')
     
     # use_textemb 관련 로깅
     if args.use_textemb:
@@ -219,6 +227,9 @@ def main():
         training_logger.info('Text embeddings will be loaded from ./semi_text_embs/merged_text_embeddings.pth')
     else:
         training_logger.info('Not using text embeddings (use_textemb=False)')
+
+    if getattr(args, 'use_hypernetwork_fusion', False):
+        training_logger.info('Using Hypernetwork Fusion: sensor DNNs generate W,b for primary network layers on img features')
 
     # ---------------------------------------------------
     # 1. Dataset / DataLoader 설정
@@ -274,7 +285,7 @@ def main():
     cls_num_list, samples_per_cls = dataloader.get_dataset_info(train_dataset)
     
     # 손실 함수 생성
-    paco_criterion, cb_criterion, mtm_criterion = create_loss_functions(args, cls_num_list, samples_per_cls, use_paco=args.use_paco, use_cb=args.use_cb, use_mtm=args.use_mtm)
+    paco_criterion, cb_criterion, mtm_criterion = create_loss_functions(args, cls_num_list, samples_per_cls)
 
     # ---------------------------------------------------
     # 3. 학습 루프
@@ -321,7 +332,7 @@ def main():
                     )
                 else:
                     # LateFusion: forward(x1, x2) -> (logits, feature_concat, vision_feat, sensor_feat)
-                    logits_moco, _, vision_feature, sensor_feature = model(images_q, sensors_q)
+                    logits_moco, feature_concat, vision_feature, sensor_feature = model(images_q, sensors_q)
                     features_moco, target_moco = None, None
                 
             elif args.modality == 'sensor':
@@ -338,7 +349,7 @@ def main():
                         labels=targets_int
                     )
                 else:
-                    logits_moco, _, vision_feature, sensor_feature = model(sensors_q)
+                    logits_moco, feature_concat, vision_feature, sensor_feature = model(sensors_q)
                     features_moco, target_moco = None, None
                 
             elif args.modality == 'vision':
@@ -355,7 +366,7 @@ def main():
                     labels=targets_int
                     )
                 else:
-                    logits_moco, _, vision_feature, sensor_feature = model(images_q)
+                    logits_moco, feature_concat, vision_feature, sensor_feature = model(images_q)
                     features_moco, target_moco = None, None
 
             pacoloss = paco_criterion(features_moco, target_moco, logits_moco) if paco_criterion is not None else torch.tensor(0.0, device=DEVICE)
@@ -367,7 +378,9 @@ def main():
             # MTMLoss 계산 (warmup 이후에만 text_emb 기반 MTM 사용)
             mtmloss = torch.tensor(0.0, device=DEVICE)
             mtm_enabled = (mtm_criterion is not None) and (epoch >= args.textemb_warmup_epochs)
-            if mtm_enabled:
+            if mtm_enabled and args.use_hypernetwork_fusion:
+                mtmloss = mtm_criterion(feature_concat, targets_int)
+            elif mtm_enabled:
                 if args.modality == 'fusion' and vision_feature is not None and sensor_feature is not None:
                     # fusion 모달리티: vision과 sensor 피쳐 모두 사용
                     mtmloss = mtm_criterion(vision_feature, sensor_feature, targets_int)

@@ -49,6 +49,8 @@ results_4y_summary*.csv
 results_4y_summary*.xlsx
 
 wandb/
+docs/
+configs/
 
 # Data files (큰 파일은 제외)
 *.zip
@@ -82,3 +84,4 @@ GIT_WORKFLOW_GUIDE.md
 
 # Train scripts (train.sh and train.py are tracked, but train_cuda*.sh are not)
 train_cuda*.sh
+train.sh
