@@ -388,63 +388,9 @@ class PrimaryNetworkWithHyperLayers(nn.Module):
             x = self.dropout(x)
         return x
 
-
-class SelfAttentionFusionHead(nn.Module):
-    """
-    Single vector를 토큰 시퀀스로 나눈 뒤 self-attention 적용.
-    F.scaled_dot_product_attention 사용 → Flash Attention 등 효율 백엔드 자동 선택.
-    """
-    def __init__(self, dim=1024, num_heads=8, num_tokens=16, dropout=0.2):
-        super(SelfAttentionFusionHead, self).__init__()
-        assert dim % num_tokens == 0, "dim must be divisible by num_tokens"
-        self.num_tokens = num_tokens
-        self.token_dim = dim // num_tokens
-        self.num_heads = num_heads
-        assert self.token_dim % num_heads == 0, "token_dim must be divisible by num_heads"
-        self.head_dim = self.token_dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.dropout_p = dropout
-
-        self.pre_norm = nn.LayerNorm(dim)
-        # QKV 한 번에 (연산/메모리 효율)
-        self.qkv = nn.Linear(self.token_dim, 3 * self.token_dim)
-        self.attn_out = nn.Linear(self.token_dim, self.token_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(self.token_dim, max(256, self.token_dim * 2)),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(max(256, self.token_dim * 2), self.token_dim),
-            nn.Dropout(dropout),
-        )
-        self.norm1 = nn.LayerNorm(self.token_dim)
-        self.norm2 = nn.LayerNorm(self.token_dim)
-        self.post_norm = nn.LayerNorm(dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        B = x.size(0)
-        x = self.pre_norm(x)
-        x = x.view(B, self.num_tokens, self.token_dim)
-        # Self-attention with SDPA (flash / memory_efficient 백엔드 자동 사용)
-        residual = x
-        qkv = self.qkv(x)
-        qkv = qkv.reshape(B, self.num_tokens, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        attn_out = F.scaled_dot_product_attention(q, k, v, scale=self.scale, dropout_p=self.dropout_p)
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, self.num_tokens, self.token_dim)
-        x = residual + self.dropout(self.attn_out(attn_out))
-        x = self.norm1(x)
-        x = x + self.ffn(x)
-        x = self.norm2(x)
-        x = x.reshape(B, -1)
-        x = self.post_norm(x)
-        return self.dropout(x)
-
-
 class LateFusionHypernetwork(nn.Module):
     """
-    병렬 DNN 4개(각 2층) → 기존 Primary dims에 맞는 W,b 생성.
+    병렬 DNN → Primary dims에 맞는 W,b 생성.
     LateFusion과 동일한 forward: (x1, x2) -> (logits, feature_concat, vision_feat, sensor_feat)
     """
     def __init__(self, vision_model, sensor_in_dim, num_classes=4,
@@ -454,29 +400,34 @@ class LateFusionHypernetwork(nn.Module):
         super(LateFusionHypernetwork, self).__init__()
         self.vision_model = vision_model
         self.num_classes = num_classes
-        # Primary layer 개수(=len(primary_dims)-1)에 맞춰 병렬 DNN 개수도 자동으로 매칭
-        primary_dims = primary_dims or [1280, 1024, 1024, 1024, 512]
+        # Primary dims 축소: 생성 파라미터 수를 대폭 줄여 과적합 방지
+        primary_dims = primary_dims or [1280, 512, 256]
         if not isinstance(primary_dims, (list, tuple)) or len(primary_dims) < 2:
-            primary_dims = [1280, 1024, 1024, 1024, 512]
-        # layer_specs: (in_dim, out_dim) for each Primary layer (총 len(primary_dims)-1개)
+            primary_dims = [1280, 512, 256]
+        # layer_specs: (in_dim, out_dim) for each Primary layer
         layer_specs = [(primary_dims[i], primary_dims[i + 1]) for i in range(len(primary_dims) - 1)]
         self.hypernetwork = Hypernetwork(sensor_in_dim=sensor_in_dim, layer_specs=layer_specs)
         self.primary_net = PrimaryNetworkWithHyperLayers(primary_dims=primary_dims, dropout=primary_dropout)
         primary_out_dim = primary_dims[-1]
 
-        # 센서는 이미 Primary의 W,b로 img에 반영됨 → primary 출력만 사용 (sensor concat/gate 제거)
+        # 센서는 이미 Primary의 W,b로 img에 반영됨 → primary 출력만 사용
         self.primary_adapter = nn.Sequential(
             nn.Linear(primary_out_dim, fusion_target_dim),
             nn.BatchNorm1d(fusion_target_dim),
             nn.ReLU(inplace=True),
         )
 
-        # add_layer: self-attention (feature를 토큰 시퀀스로 쪼갠 뒤 Transformer) → 출력 1024
-        self.add_layer = SelfAttentionFusionHead(
-            dim=fusion_target_dim,
-            num_heads=8,
-            num_tokens=16,
-            dropout=0.2,
+        # add_layer: 2-layer MLP (SA 대체, 과도한 복잡성 제거)
+        mlp_hidden = fusion_target_dim // 2  # 512
+        self.add_layer = nn.Sequential(
+            nn.Linear(fusion_target_dim, mlp_hidden),
+            nn.BatchNorm1d(mlp_hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(mlp_hidden, fusion_target_dim),
+            nn.BatchNorm1d(fusion_target_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
         )
         self.fusion_head_out_dim = fusion_target_dim
         self.classifier = nn.Linear(fusion_target_dim, num_classes)
@@ -524,9 +475,9 @@ def create_model(args, device):
 
         if use_hypernetwork_fusion:
             sensor_in_dim = 8 if args.data == 'sms' else 7
-            primary_dims = _parse_hypernetwork_dims(getattr(args, 'hypernetwork_primary_dims', None)) or [1280, 1024, 1024, 1024, 512]
+            primary_dims = _parse_hypernetwork_dims(getattr(args, 'hypernetwork_primary_dims', None)) or [1280, 512, 256]
             if not isinstance(primary_dims, (list, tuple)) or len(primary_dims) < 2:
-                primary_dims = [1280, 1024, 1024, 1024, 512]
+                primary_dims = [1280, 512, 256]
 
             primary_dropout = getattr(args, 'hypernetwork_primary_dropout', 0.0)
             fusion_model = LateFusionHypernetwork(
@@ -593,12 +544,19 @@ def create_optimizer_and_scheduler(model, args):
     weight_decay = getattr(args, 'weight_decay', 5e-4)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
 
-    # 스케줄러
+    # Warmup 설정: 처음 5 epoch 동안 lr을 0.01배 → 1배로 선형 증가
+    warmup_epochs = 5
+
+    # 메인 스케줄러
     if args.scheduler == 'default':
         scheduler = None
     elif args.scheduler == 'step':
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=0.1)
+        main_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=0.1)
+        warmup_scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+        scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
     elif args.scheduler == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
+        main_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs - warmup_epochs, eta_min=1e-6)
+        warmup_scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+        scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
     
     return optimizer, scheduler

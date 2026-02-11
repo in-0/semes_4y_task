@@ -174,20 +174,34 @@ class GDCMDFusion(Dataset):
                     transforms.ToTensor()
                 ])
             else:
-                # 기본 augmentation (MoCo 사용 안 할 때)
+                # 중간 수준 augmentation (PaCo 미사용 시 과적합 방지)
                 self.transform = transforms.Compose([
                     transforms.ToPILImage(), 
-                    transforms.Resize((image_size, image_size)), 
-                    transforms.RandomCrop((image_size, image_size), padding=4),
+                    transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0)),
+                    transforms.RandomApply([
+                        transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+                    ], p=0.5),
+                    transforms.RandomGrayscale(p=0.1),
+                    transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.3),
                     transforms.RandomHorizontalFlip(),
-                    transforms.ToTensor()
+                    transforms.RandomVerticalFlip(p=0.2),
+                    transforms.RandomApply([transforms.RandomRotation(15)], p=0.3),
+                    transforms.ToTensor(),
+                    transforms.RandomErasing(p=0.2, scale=(0.02, 0.2)),
                 ])
                 self.transform2 = transforms.Compose([
                     transforms.ToPILImage(), 
-                    transforms.Resize((image_size, image_size)), 
-                    transforms.RandomCrop((image_size, image_size), padding=4),
+                    transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0)),
+                    transforms.RandomApply([
+                        transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+                    ], p=0.5),
+                    transforms.RandomGrayscale(p=0.1),
+                    transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.3),
                     transforms.RandomHorizontalFlip(),
-                    transforms.ToTensor()
+                    transforms.RandomVerticalFlip(p=0.2),
+                    transforms.RandomApply([transforms.RandomRotation(15)], p=0.3),
+                    transforms.ToTensor(),
+                    transforms.RandomErasing(p=0.2, scale=(0.02, 0.2)),
                 ])
         else:
             self.transform = transforms.Compose([
@@ -322,22 +336,36 @@ class SEMIDataset(Dataset):
                     transforms.ToTensor(),
                 ])
             else:
-                # 기본 augmentation (MoCo 사용 안 할 때)
+                # 중간 수준 augmentation (PaCo 미사용 시 과적합 방지)
                 self.transform_q = transforms.Compose([
                     transforms.ToPILImage(),
                     transforms.Lambda(lambda img: img.convert('RGB')),
-                    transforms.Resize((image_size, image_size)),
-                    transforms.RandomCrop((image_size, image_size), padding=4),
+                    transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0)),
+                    transforms.RandomApply([
+                        transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+                    ], p=0.5),
+                    transforms.RandomGrayscale(p=0.1),
+                    transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.3),
                     transforms.RandomHorizontalFlip(),
+                    transforms.RandomVerticalFlip(p=0.2),
+                    transforms.RandomApply([transforms.RandomRotation(15)], p=0.3),
                     transforms.ToTensor(),
+                    transforms.RandomErasing(p=0.2, scale=(0.02, 0.2)),
                 ])
                 self.transform_k = transforms.Compose([
                     transforms.ToPILImage(),
                     transforms.Lambda(lambda img: img.convert('RGB')),
-                    transforms.Resize((image_size, image_size)),
-                    transforms.RandomCrop((image_size, image_size), padding=4),
+                    transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0)),
+                    transforms.RandomApply([
+                        transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+                    ], p=0.5),
+                    transforms.RandomGrayscale(p=0.1),
+                    transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.3),
                     transforms.RandomHorizontalFlip(),
+                    transforms.RandomVerticalFlip(p=0.2),
+                    transforms.RandomApply([transforms.RandomRotation(15)], p=0.3),
                     transforms.ToTensor(),
+                    transforms.RandomErasing(p=0.2, scale=(0.02, 0.2)),
                 ])
         else:
             self.transform_q = transforms.Compose([

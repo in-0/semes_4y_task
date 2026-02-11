@@ -40,6 +40,7 @@ parser.add_argument('--use_textemb', action='store_true', help='Use text embeddi
 parser.add_argument('--use_dim_matching_layer', action='store_true', help='Use dimension matching layer in LateFusion (target_dim=1024)')
 parser.add_argument('--use_gated_fusion', action='store_true', help='Use gated fusion (gate*v + (1-gate)*s) in LateFusion; only effective when use_dim_matching_layer is True')
 parser.add_argument('--textemb_warmup_epochs', type=int, default=0, help='Number of warmup epochs without text embeddings (only after this epoch textemb is enabled)')
+parser.add_argument('--use_strong_aug', action='store_true', help='Use strong augmentation (independent of use_paco). If False, moderate augmentation is used by default.')
 
 # Hypernetwork fusion (sensor → W,b for primary network layers)
 parser.add_argument('--use_hypernetwork_fusion', action='store_true', help='Use hypernetwork fusion: sensor DNNs generate weights/biases for part of primary network layers on img features')
@@ -236,12 +237,12 @@ def main():
     # 1. Dataset / DataLoader 설정
     # ---------------------------------------------------
     training_logger.info('Loading datasets...')
-    # MoCo 사용 시에만 강한 augmentation 적용
-    use_strong_aug = args.use_paco
+    # use_strong_aug: 독립적으로 설정 가능 (use_paco=True이면 자동으로 strong aug)
+    use_strong_aug = getattr(args, 'use_strong_aug', False) or args.use_paco
     if use_strong_aug:
-        training_logger.info('Using strong augmentation for MoCo training')
+        training_logger.info('Using strong augmentation (MoCo v2 style)')
     else:
-        training_logger.info('Using basic augmentation (MoCo not used)')
+        training_logger.info('Using moderate augmentation (RandomResizedCrop + ColorJitter + GaussianBlur + RandomErasing)')
     
     if args.data == 'gdcm':
         data_root = './data/GDCMD'
