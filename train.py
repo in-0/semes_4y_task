@@ -63,7 +63,11 @@ parser.add_argument('--mtm_use_l_agree', action='store_true', help='Use L_agree 
 
 # args for loss functions
 parser.add_argument('--use_paco', action='store_true', help='Use PaCoLoss')
-parser.add_argument('--use_cb', action='store_true', help='Use CBLoss')
+parser.add_argument('--use_cb', action='store_true', help='Use CBLoss (original weighted BCE)')
+parser.add_argument('--use_cb_focal', action='store_true', help='Use CB-Focal Loss (CB weighting + focal modulation). Overrides use_cb.')
+parser.add_argument('--cb_focal_gamma', type=float, default=2.0, help='Focal Loss gamma (default: 2.0)')
+parser.add_argument('--use_ldam', action='store_true', help='Use LDAM Loss (label-distribution-aware margin). Overrides use_cb and use_cb_focal.')
+parser.add_argument('--ldam_max_margin', type=float, default=0.5, help='LDAM max margin (default: 0.5)')
 parser.add_argument('--use_mtm', action='store_true', help='Use MTMLoss (Modality-Text Matching Loss)')
 
 # debug mode: 작은 데이터셋, 1 epoch, 로그 간격 1 step

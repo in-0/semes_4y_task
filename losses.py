@@ -142,6 +142,109 @@ class CBLoss(nn.Module):
         cb_loss = F.binary_cross_entropy(input=pred, target=labels_one_hot, weight=weights)
         return cb_loss
 
+
+class CBFocalLoss(nn.Module):
+    """Class-Balanced Focal Loss.
+
+    CB weighting (effective number) + Focal modulation (1-p_t)^γ 결합.
+    기존 CBLoss와 달리 F.cross_entropy 기반으로 수치 안정성 확보.
+
+    Args:
+        samples_per_cls: 클래스별 샘플 수 리스트
+        no_of_classes: 클래스 수
+        beta: CB weighting의 β (default: 0.9999)
+        gamma: Focal Loss의 γ (default: 2.0, 0이면 focal 효과 없음)
+    """
+    def __init__(self, samples_per_cls, no_of_classes, beta=0.9999, gamma=2.0):
+        super(CBFocalLoss, self).__init__()
+        self.no_of_classes = no_of_classes
+        self.gamma = gamma
+
+        # CB weights 미리 계산
+        effective_num = 1.0 - np.power(beta, np.array(samples_per_cls, dtype=np.float64))
+        weights = (1.0 - beta) / effective_num
+        weights = weights / np.sum(weights) * no_of_classes
+        self.register_buffer('cb_weights', torch.tensor(weights, dtype=torch.float32))
+
+    def forward(self, logits, labels):
+        """
+        Args:
+            logits: [B, C] raw logits
+            labels: [B, C] one-hot encoded labels
+        """
+        targets_int = labels.argmax(dim=1)  # [B]
+        cb_w = self.cb_weights.to(logits.device)
+
+        # Per-sample CB weight
+        per_sample_cb = cb_w[targets_int]  # [B]
+
+        # Focal modulation: (1 - p_t)^γ
+        with torch.no_grad():
+            probs = F.softmax(logits, dim=1)  # [B, C]
+            p_t = probs.gather(1, targets_int.unsqueeze(1)).squeeze(1)  # [B]
+            focal_weight = (1.0 - p_t) ** self.gamma  # [B]
+
+        # CE per sample (numerically stable)
+        ce_loss = F.cross_entropy(logits, targets_int, reduction='none')  # [B]
+
+        # Combined: CB weight × focal weight × CE
+        loss = (per_sample_cb * focal_weight * ce_loss).mean()
+        return loss
+
+
+class LDAMLoss(nn.Module):
+    """Label-Distribution-Aware Margin (LDAM) Loss.
+
+    Cao et al., "Learning Imbalanced Datasets with Label-Distribution-Aware
+    Margin Loss", NeurIPS 2019.
+
+    소수 클래스에 더 큰 마진 Δ_j = C / n_j^{1/4}을 부여하여
+    결정 경계를 소수 클래스 쪽으로 확장.
+
+    Args:
+        samples_per_cls: 클래스별 샘플 수 리스트
+        no_of_classes: 클래스 수
+        max_margin: 최대 마진 값 (default: 0.5)
+        cb_beta: CB weighting의 β (default: 0.9999, None이면 CB weight 미사용)
+    """
+    def __init__(self, samples_per_cls, no_of_classes, max_margin=0.5, cb_beta=0.9999):
+        super(LDAMLoss, self).__init__()
+        self.no_of_classes = no_of_classes
+
+        # 클래스별 마진: Δ_j = C / n_j^{1/4}, max_margin으로 정규화
+        samples_np = np.array(samples_per_cls, dtype=np.float64)
+        margins = 1.0 / np.power(samples_np, 0.25)
+        margins = margins * (max_margin / np.max(margins))
+        self.register_buffer('margins', torch.tensor(margins, dtype=torch.float32))
+
+        # 선택적 CB weighting (DRW와 유사)
+        if cb_beta is not None:
+            effective_num = 1.0 - np.power(cb_beta, samples_np)
+            weights = (1.0 - cb_beta) / effective_num
+            weights = weights / np.sum(weights) * no_of_classes
+            self.register_buffer('class_weights', torch.tensor(weights, dtype=torch.float32))
+        else:
+            self.class_weights = None
+
+    def forward(self, logits, labels):
+        """
+        Args:
+            logits: [B, C] raw logits
+            labels: [B, C] one-hot encoded labels
+        """
+        targets_int = labels.argmax(dim=1)  # [B]
+        margins = self.margins.to(logits.device)
+
+        # GT 클래스의 logit에서 마진 차감
+        margin_per_sample = margins[targets_int]  # [B]
+        adjusted_logits = logits.clone()
+        adjusted_logits[torch.arange(logits.size(0), device=logits.device), targets_int] -= margin_per_sample
+
+        # Cross entropy (CB weight 적용)
+        weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
+        loss = F.cross_entropy(adjusted_logits, targets_int, weight=weight)
+        return loss
+
 class MTMLoss(nn.Module):
     """Modality-Text Matching Loss"""
     def __init__(self, num_classes=4, lambda_weight=0.5, use_l_agree=True, text_emb_path='./semi_text_embs/merged_text_embeddings.pth'):
@@ -427,14 +530,27 @@ def create_loss_functions(args, cls_num_list, samples_per_cls):
     else:
         paco_criterion = None
     
-    # CBLoss 설정
-    if args.use_cb:
+    # 분류 손실 설정 (LDAM > CB-Focal > CB 우선순위)
+    use_ldam = getattr(args, 'use_ldam', False)
+    use_cb_focal = getattr(args, 'use_cb_focal', False)
+
+    if use_ldam:
+        ldam_max_margin = getattr(args, 'ldam_max_margin', 0.5)
+        cb_criterion = LDAMLoss(
+            samples_per_cls=samples_per_cls, no_of_classes=args.num_classes,
+            max_margin=ldam_max_margin, cb_beta=0.9999)
+    elif use_cb_focal:
+        cb_focal_gamma = getattr(args, 'cb_focal_gamma', 2.0)
+        cb_criterion = CBFocalLoss(
+            samples_per_cls=samples_per_cls, no_of_classes=args.num_classes,
+            beta=0.9999, gamma=cb_focal_gamma)
+    elif args.use_cb:
         cb_criterion = CBLoss(samples_per_cls=samples_per_cls, no_of_classes=4, beta=0.9999, gamma=2)
     else:
         cb_criterion = None
     
     # MTMLoss 설정
-    if args.use_mtm and args.use_hypernetwork_fusion:
+    if args.use_mtm and getattr(args, 'use_hypernetwork_fusion', False):
         mtm_criterion = HNMTMLoss(num_classes=args.num_classes)
     elif args.use_mtm:
         mtm_criterion = MTMLoss(num_classes=args.num_classes, lambda_weight=args.mtm_lambda, use_l_agree=args.mtm_use_l_agree)
